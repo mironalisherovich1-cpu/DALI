@@ -1,8 +1,11 @@
+import asyncio
+import json
 import logging
 import os
-import re
+import random
 import time
-from typing import Dict, Any, Optional
+from decimal import Decimal, ROUND_DOWN
+from typing import Dict, Any, Optional, List
 
 import aiohttp
 from aiogram import Bot, Dispatcher, executor, types
@@ -15,37 +18,177 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 
-# ===== Products =====
+# =========================
+# SETTINGS
+# =========================
+REQUIRED_CONFIRMATIONS = 1
+POLL_INTERVAL_SEC = 30
+
+# Unique amount "salt" (in litoshi): 1 litoshi = 0.00000001 LTC
+# We'll add 700..9900 litoshi (~0.00000700..0.00009900 LTC) to make each invoice unique.
+SALT_MIN_LITOSHI = 700
+SALT_MAX_LITOSHI = 9900
+
+# Persist state to file (Railway container may restart; this helps when it doesn't wipe)
+STATE_FILE = "state.json"
+
+# BlockCypher (optional token for higher limits)
+BLOCKCYPHER_TOKEN = os.getenv("BLOCKCYPHER_TOKEN", "").strip()
+BC_BASE = "https://api.blockcypher.com/v1/ltc/main"
+
+# CoinGecko rate (free, no key typically)
+COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currencies=usd"
+
+
+# =========================
+# PRODUCTS
+# =========================
 PRODUCTS = {
     "1": {"name": "GSH MAROCCO 0.5", "price_usd": 25},
     "2": {"name": "GSH MAROCCO 1", "price_usd": 45},
 }
 
-# ===== Payment state =====
-WAITING_TXID: Dict[int, Dict[str, Any]] = {}     # user_id -> {"pid": str, "created_at": int}
-USED_TXIDS: set[str] = set()                     # txid used once (restart bo'lsa tozalanadi)
 
-TXID_RE = re.compile(r"^[a-fA-F0-9]{64}$")
-
-# BlockCypher (optional token for higher limits)
-BLOCKCYPHER_TOKEN = os.getenv("BLOCKCYPHER_TOKEN", "").strip()
-BLOCKCYPHER_BASE = "https://api.blockcypher.com/v1/ltc/main"
-REQUIRED_CONFIRMATIONS = 1
+# =========================
+# STATE
+# =========================
+STATE: Dict[str, Any] = {
+    "order_seq": 0,
+    "pending": {},   # order_id(str) -> order dict
+    "paid": {},      # order_id(str) -> order dict
+    "seen_tx": [],   # list of tx_hash already counted (best-effort)
+}
 
 http: Optional[aiohttp.ClientSession] = None
 
 
-# ===== Keyboards =====
+def load_state():
+    global STATE
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                STATE = json.load(f)
+    except Exception as e:
+        logging.warning(f"Failed to load state: {e}")
+
+
+def save_state():
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(STATE, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.warning(f"Failed to save state: {e}")
+
+
+def new_order_id() -> int:
+    STATE["order_seq"] = int(STATE.get("order_seq", 0)) + 1
+    save_state()
+    return STATE["order_seq"]
+
+
+def ltc_to_litoshi(ltc: Decimal) -> int:
+    # 1 LTC = 100,000,000 litoshi
+    return int((ltc * Decimal("100000000")).to_integral_value(rounding=ROUND_DOWN))
+
+
+def litoshi_to_ltc_str(litoshi: int) -> str:
+    ltc = Decimal(litoshi) / Decimal("100000000")
+    # show up to 8 decimals
+    s = f"{ltc:.8f}"
+    # trim trailing zeros
+    s = s.rstrip("0").rstrip(".")
+    return s
+
+
+async def get_http() -> aiohttp.ClientSession:
+    global http
+    if http is None or http.closed:
+        http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
+    return http
+
+
+def bc_url(path: str) -> str:
+    url = f"{BC_BASE}{path}"
+    if BLOCKCYPHER_TOKEN:
+        joiner = "&" if "?" in url else "?"
+        url = f"{url}{joiner}token={BLOCKCYPHER_TOKEN}"
+    return url
+
+
+async def fetch_json(url: str) -> Dict[str, Any]:
+    session = await get_http()
+    async with session.get(url) as r:
+        txt = await r.text()
+        if r.status != 200:
+            raise RuntimeError(f"HTTP {r.status}: {txt[:300]}")
+        try:
+            return json.loads(txt)
+        except Exception:
+            raise RuntimeError(f"Non-JSON response: {txt[:200]}")
+
+
+async def get_ltc_usd_rate() -> Decimal:
+    """
+    Returns: 1 LTC in USD
+    """
+    data = await fetch_json(COINGECKO_URL)
+    usd = data.get("litecoin", {}).get("usd")
+    if usd is None:
+        raise RuntimeError("Rate not found")
+    return Decimal(str(usd))
+
+
+async def get_chain_height() -> int:
+    data = await fetch_json(bc_url(""))
+    h = data.get("height")
+    if not isinstance(h, int):
+        raise RuntimeError("Chain height not found")
+    return h
+
+
+def confirmations_from_tx(tx: Dict[str, Any], chain_height: int) -> int:
+    conf = tx.get("confirmations")
+    if isinstance(conf, int):
+        return conf
+    bh = tx.get("block_height")
+    if isinstance(bh, int) and bh >= 0:
+        return max(0, (chain_height - bh + 1))
+    return 0
+
+
+def total_paid_to_address_litoshi(tx: Dict[str, Any], addr: str) -> int:
+    total = 0
+    for out in tx.get("outputs", []) or []:
+        addrs = out.get("addresses") or []
+        if addr in addrs:
+            v = out.get("value")
+            if isinstance(v, int) and v > 0:
+                total += v
+    return total
+
+
+async def fetch_recent_txs_for_address(addr: str, limit: int = 50) -> List[Dict[str, Any]]:
+    # /addrs/<addr>/full returns txs (may be heavy; limit helps)
+    data = await fetch_json(bc_url(f"/addrs/{addr}/full?limit={limit}"))
+    txs = data.get("txs") or []
+    if not isinstance(txs, list):
+        return []
+    return txs
+
+
+# =========================
+# KEYBOARDS
+# =========================
 def main_menu():
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(types.InlineKeyboardButton("🛍 Товарлар", callback_data="products"))
-    kb.add(types.InlineKeyboardButton("💳 Тўлов (LTC)", callback_data="pay_ltc"))
+    kb.add(types.InlineKeyboardButton("📦 Менинг заказларим", callback_data="my_orders"))
     kb.add(types.InlineKeyboardButton("🔄 Обменники", callback_data="exchange"))
     kb.add(types.InlineKeyboardButton("☎️ Алоқа", callback_data="contact"))
     return kb
 
 
-def back_menu():
+def back_main_kb():
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(types.InlineKeyboardButton("⬅️ Орқа (Бош меню)", callback_data="back"))
     return kb
@@ -59,161 +202,184 @@ def products_kb():
     return kb
 
 
-def buy_kb(pid: str):
+def invoice_kb(order_id: int):
     kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(types.InlineKeyboardButton("💳 Тўлов (LTC)", callback_data=f"pay_{pid}"))
-    kb.add(types.InlineKeyboardButton("⬅️ Орқа (Товарлар)", callback_data="products"))
+    kb.add(types.InlineKeyboardButton("🔄 Текшириш (ҳозир)", callback_data=f"check_{order_id}"))
     kb.add(types.InlineKeyboardButton("🏠 Бош меню", callback_data="back"))
     return kb
 
 
-def pay_back_kb(pid: str):
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(types.InlineKeyboardButton("⬅️ Орқа (Товар)", callback_data=f"buy_{pid}"))
-    kb.add(types.InlineKeyboardButton("🏠 Бош меню", callback_data="back"))
-    return kb
+# =========================
+# ORDER HELPERS
+# =========================
+def make_order(user: types.User, pid: str, need_litoshi: int, salt_litoshi: int) -> Dict[str, Any]:
+    oid = new_order_id()
+    p = PRODUCTS[pid]
+    order = {
+        "order_id": oid,
+        "user_id": user.id,
+        "username": user.username,
+        "pid": pid,
+        "product_name": p["name"],
+        "price_usd": p["price_usd"],
+        "need_litoshi": need_litoshi,
+        "salt_litoshi": salt_litoshi,
+        "total_litoshi": need_litoshi + salt_litoshi,
+        "address": LTC_WALLET,
+        "status": "PENDING",
+        "created_at": int(time.time()),
+        "paid_tx": None,
+        "confirmations": 0,
+    }
+    return order
 
 
-# ===== HTTP / BlockCypher helpers =====
-async def get_http() -> aiohttp.ClientSession:
-    global http
-    if http is None or http.closed:
-        http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
-    return http
+def store_pending(order: Dict[str, Any]):
+    STATE["pending"][str(order["order_id"])] = order
+    save_state()
 
 
-def bc_url(path: str) -> str:
-    url = f"{BLOCKCYPHER_BASE}{path}"
-    if BLOCKCYPHER_TOKEN:
-        joiner = "&" if "?" in url else "?"
-        url = f"{url}{joiner}token={BLOCKCYPHER_TOKEN}"
-    return url
-
-
-async def fetch_json(url: str) -> Dict[str, Any]:
-    session = await get_http()
-    async with session.get(url) as r:
-        # BlockCypher returns JSON even on many errors, but keep it safe
-        if r.status != 200:
-            txt = await r.text()
-            raise RuntimeError(f"HTTP {r.status}: {txt[:300]}")
-        return await r.json()
-
-
-async def get_chain_height() -> int:
-    data = await fetch_json(bc_url(""))
-    # docs: chain endpoint returns "height"
-    h = data.get("height")
-    if not isinstance(h, int):
-        raise RuntimeError("Chain height not found")
-    return h
-
-
-def confirmations_from_tx(tx: Dict[str, Any], chain_height: int) -> int:
-    # BlockCypher may include "confirmations". If not, derive from height and block_height.
-    conf = tx.get("confirmations")
-    if isinstance(conf, int):
-        return conf
-    bh = tx.get("block_height")
-    if isinstance(bh, int) and bh >= 0:
-        return max(0, (chain_height - bh + 1))
-    return 0
-
-
-def paid_to_our_address(tx: Dict[str, Any], our_addr: str) -> int:
-    """
-    Returns total satoshis in outputs that pay to our address.
-    """
-    total = 0
-    for out in tx.get("outputs", []) or []:
-        addrs = out.get("addresses") or []
-        if our_addr in addrs:
-            v = out.get("value")
-            if isinstance(v, int) and v > 0:
-                total += v
-    return total
-
-
-async def verify_txid(txid: str, our_addr: str, created_at: int) -> Dict[str, Any]:
-    """
-    Verify:
-      - tx exists
-      - pays to our address (value > 0)
-      - not double spend (best-effort)
-      - not too old compared to order created_at (replay protection)
-      - confirmations >= REQUIRED_CONFIRMATIONS
-    """
-    tx = await fetch_json(bc_url(f"/txs/{txid}"))
-    if tx.get("double_spend") is True:
-        return {"ok": False, "reason": "double_spend", "tx": tx}
-
-    # Replay protection by time: tx.received is ISO8601 string; we use 'received'/'confirmed' presence loosely.
-    # BlockCypher also returns 'received' time; if missing, skip.
-    # We'll do a soft check: if tx has "received" and it's far older than created_at-10min -> reject.
-    received = tx.get("received")  # ISO8601 or absent
-    if isinstance(received, str) and len(received) >= 10:
-        # best-effort parse without dateutil: compare only by "time since created" is hard
-        # We'll instead rely on: tx must be NOT already used in this bot + must pay to our address.
-        pass
-
-    paid_sat = paid_to_our_address(tx, our_addr)
-    if paid_sat <= 0:
-        return {"ok": False, "reason": "not_to_our_address", "tx": tx}
-
-    chain_height = await get_chain_height()
-    conf = confirmations_from_tx(tx, chain_height)
-    if conf < REQUIRED_CONFIRMATIONS:
-        return {"ok": False, "reason": "not_confirmed_yet", "confirmations": conf, "tx": tx}
-
-    return {"ok": True, "confirmations": conf, "paid_sat": paid_sat, "tx": tx}
-
-
-# ===== Handlers =====
-@dp.message_handler(commands=["start"])
-async def start(message: types.Message):
-    await message.answer("✅ Бот ишлаяпти.\nБош меню:", reply_markup=main_menu())
-
-
-@dp.message_handler(commands=["check"])
-async def check_cmd(message: types.Message):
-    parts = (message.text or "").strip().split()
-    if len(parts) != 2:
-        await message.answer("Фойдаланиш: /check <TXID>", reply_markup=main_menu())
+def mark_paid(order_id: int, tx_hash: str, confirmations: int):
+    oid = str(order_id)
+    order = STATE["pending"].get(oid)
+    if not order:
         return
-    txid = parts[1].strip()
-    if not TXID_RE.match(txid):
-        await message.answer("TXID формати нотўғри (64 hex).", reply_markup=main_menu())
+    order["status"] = "PAID"
+    order["paid_tx"] = tx_hash
+    order["confirmations"] = confirmations
+    STATE["paid"][oid] = order
+    STATE["pending"].pop(oid, None)
+    save_state()
+
+
+def find_user_orders_text(user_id: int) -> str:
+    pend = [o for o in STATE["pending"].values() if o.get("user_id") == user_id]
+    paid = [o for o in STATE["paid"].values() if o.get("user_id") == user_id]
+
+    lines = []
+    if not pend and not paid:
+        return "Сизда ҳали заказ йўқ."
+
+    if pend:
+        lines.append("⏳ Pending заказлар:")
+        for o in sorted(pend, key=lambda x: x.get("order_id", 0)):
+            lines.append(
+                f"• #{o['order_id']} — {o['product_name']} — {o['price_usd']}$ — "
+                f"{litoshi_to_ltc_str(o['total_litoshi'])} LTC"
+            )
+    if paid:
+        lines.append("\n✅ Тасдиқланган заказлар:")
+        for o in sorted(paid, key=lambda x: x.get("order_id", 0)):
+            lines.append(
+                f"• #{o['order_id']} — {o['product_name']} — PAID (conf: {o.get('confirmations', 0)})"
+            )
+    return "\n".join(lines)
+
+
+# =========================
+# BACKGROUND PAYMENT CHECK
+# =========================
+async def check_payments_once():
+    """
+    Pull recent txs to LTC_WALLET and match against pending orders by total_litoshi.
+    """
+    if not LTC_WALLET:
         return
-    if txid in USED_TXIDS:
-        await message.answer("Бу TXID аввал ишлатилган.", reply_markup=main_menu())
+    if not STATE["pending"]:
         return
 
     try:
-        res = await verify_txid(txid, LTC_WALLET, created_at=int(time.time()))
+        chain_h = await get_chain_height()
+        txs = await fetch_recent_txs_for_address(LTC_WALLET, limit=50)
     except Exception as e:
-        await message.answer(f"Текширувда хато: {e}", reply_markup=main_menu())
+        logging.warning(f"Payment check failed: {e}")
         return
 
-    if res.get("ok"):
-        await message.answer(
-            f"✅ TXID тўғри. Confirmations: {res.get('confirmations')}\n"
-            "Агар бу сизники бўлса, тўлов қабул қилинган.",
-            reply_markup=main_menu(),
-        )
-    else:
-        reason = res.get("reason")
-        if reason == "not_confirmed_yet":
-            await message.answer(
-                f"⏳ TX топилди, лекин ҳали confirmations кам: {res.get('confirmations', 0)}.\n"
-                "Бироз кутинг ва қайта /check қилинг.",
-                reply_markup=main_menu(),
+    seen_tx = set(STATE.get("seen_tx", []))
+    pending_orders = list(STATE["pending"].values())
+
+    # Build lookup by expected amount
+    by_amount: Dict[int, List[Dict[str, Any]]] = {}
+    for o in pending_orders:
+        by_amount.setdefault(int(o["total_litoshi"]), []).append(o)
+
+    for tx in txs:
+        tx_hash = tx.get("hash")
+        if not isinstance(tx_hash, str):
+            continue
+
+        paid_litoshi = total_paid_to_address_litoshi(tx, LTC_WALLET)
+        if paid_litoshi <= 0:
+            continue
+
+        # match only if exact amount matches a pending order
+        if paid_litoshi not in by_amount:
+            continue
+
+        conf = confirmations_from_tx(tx, chain_h)
+        if conf < REQUIRED_CONFIRMATIONS:
+            continue
+
+        # Prevent counting same tx multiple times (best-effort)
+        if tx_hash in seen_tx:
+            continue
+
+        # Choose the oldest pending order with that amount
+        candidates = sorted(by_amount[paid_litoshi], key=lambda x: x.get("created_at", 0))
+        if not candidates:
+            continue
+
+        order = candidates[0]
+        order_id = int(order["order_id"])
+        user_id = int(order["user_id"])
+
+        # Mark paid
+        mark_paid(order_id, tx_hash, conf)
+
+        # Remember tx
+        seen_tx.add(tx_hash)
+        STATE["seen_tx"] = list(seen_tx)[-500:]  # keep last 500
+        save_state()
+
+        # Notify user
+        try:
+            await bot.send_message(
+                user_id,
+                f"✅ Тўлов автоматик тасдиқланди.\n"
+                f"Заказ #{order_id}\n"
+                f"Товар: {order['product_name']}\n"
+                f"Тушган сумма: {litoshi_to_ltc_str(paid_litoshi)} LTC\n"
+                f"Confirmations: {conf}\n\n"
+                f"🏠 Бош меню: /start",
+                reply_markup=main_menu()
             )
-        elif reason == "not_to_our_address":
-            await message.answer("❌ Бу TX сенинг тўлов адресингга тушмаган.", reply_markup=main_menu())
-        elif reason == "double_spend":
-            await message.answer("❌ Double-spend деб белгиланган TX. Қабул қилинмайди.", reply_markup=main_menu())
-        else:
-            await message.answer("❌ TX текширувдан ўтмади.", reply_markup=main_menu())
+        except Exception as e:
+            logging.warning(f"Notify user failed: {e}")
+
+        # Optional admin info
+        if isinstance(ADMIN_ID, int) and ADMIN_ID != 0:
+            try:
+                await bot.send_message(
+                    ADMIN_ID,
+                    f"✅ AUTO-CONFIRM\nOrder #{order_id}\nUser: {user_id}\n"
+                    f"Amount: {litoshi_to_ltc_str(paid_litoshi)} LTC\nTX: {tx_hash}"
+                )
+            except Exception:
+                pass
+
+
+async def payments_loop():
+    while True:
+        await check_payments_once()
+        await asyncio.sleep(POLL_INTERVAL_SEC)
+
+
+# =========================
+# HANDLERS
+# =========================
+@dp.message_handler(commands=["start"])
+async def start(message: types.Message):
+    await message.answer("✅ Бот ишлаяпти.\nБош меню:", reply_markup=main_menu())
 
 
 @dp.callback_query_handler(lambda c: c.data == "back")
@@ -237,60 +403,82 @@ async def products(call: types.CallbackQuery):
 @dp.callback_query_handler(lambda c: c.data.startswith("buy_"))
 async def buy(call: types.CallbackQuery):
     pid = call.data.split("_", 1)[1]
-    p = PRODUCTS.get(pid)
-    if not p:
+    if pid not in PRODUCTS:
         await call.answer("Товар топилмади", show_alert=True)
         return
 
-    text = (
-        "🛒 Товар танланди\n\n"
-        f"Номи: {p['name']}\n"
-        f"Нарх: {p['price_usd']}$\n\n"
-        "Давом этиш учун тўлов бўлимига ўтинг."
-    )
+    p = PRODUCTS[pid]
+
+    # 1) get rate
     try:
-        await call.message.edit_text(text, reply_markup=buy_kb(pid))
+        ltc_usd = await get_ltc_usd_rate()  # 1 LTC in USD
+    except Exception as e:
+        await call.answer()
+        await call.message.answer(f"Курсни олишда хато: {e}", reply_markup=main_menu())
+        return
+
+    # 2) compute needed LTC (USD / (USD per LTC))
+    usd = Decimal(str(p["price_usd"]))
+    need_ltc = (usd / ltc_usd)
+
+    # round DOWN to 8 decimals in litoshi
+    need_litoshi = ltc_to_litoshi(need_ltc)
+
+    # 3) add salt
+    salt_litoshi = random.randint(SALT_MIN_LITOSHI, SALT_MAX_LITOSHI)
+
+    order = make_order(call.from_user, pid, need_litoshi, salt_litoshi)
+    store_pending(order)
+
+    total_ltc_str = litoshi_to_ltc_str(order["total_litoshi"])
+    rate_str = f"{ltc_usd:.2f}"
+
+    text = (
+        "🧾 Invoice (TXID керак эмас)\n\n"
+        f"Заказ #{order['order_id']}\n"
+        f"Товар: {order['product_name']}\n"
+        f"Нарх: {order['price_usd']}$\n"
+        f"Курс: 1 LTC = {rate_str} USD\n\n"
+        f"✅ Тўлашингиз керак бўлган сумма (аниқ):\n"
+        f"**{total_ltc_str} LTC**\n\n"
+        f"📩 Адрес:\n{LTC_WALLET}\n\n"
+        f"⚠️ Фақат шу аниқ суммани юборинг.\n"
+        f"Тушиши билан бот автоматик тасдиқлайди (conf ≥ {REQUIRED_CONFIRMATIONS})."
+    )
+
+    try:
+        await call.message.edit_text(text, reply_markup=invoice_kb(order["order_id"]), parse_mode="Markdown")
     except MessageNotModified:
         pass
     await call.answer()
 
 
-@dp.callback_query_handler(lambda c: c.data.startswith("pay_"))
-async def pay_for_product(call: types.CallbackQuery):
-    pid = call.data.split("_", 1)[1]
-    p = PRODUCTS.get(pid)
-    if not p:
-        await call.answer("Товар топилмади", show_alert=True)
+@dp.callback_query_handler(lambda c: c.data.startswith("check_"))
+async def manual_check(call: types.CallbackQuery):
+    oid = call.data.split("_", 1)[1]
+    order = STATE["pending"].get(str(oid)) or STATE["paid"].get(str(oid))
+    if not order:
+        await call.answer("Заказ топилмади", show_alert=True)
         return
 
-    WAITING_TXID[call.from_user.id] = {"pid": pid, "created_at": int(time.time())}
+    if str(oid) in STATE["paid"]:
+        await call.answer("Аллақачон тасдиқланган ✅", show_alert=True)
+        return
 
-    text = (
-        "💳 Тўлов (LTC)\n\n"
-        f"Товар: {p['name']}\n"
-        f"Сумма: {p['price_usd']}$\n\n"
-        f"LTC адрес:\n{LTC_WALLET}\n\n"
-        "✅ Тўлов қилинг ва кейин шу чатга TXID юборинг.\n"
-        "TXID — 64та символ (hash).\n\n"
-        "Агар confirmations 0 бўлса, бот сизга 'кутинг' дейди.\n"
-        "Кейин /check <TXID> билан қайта текширса бўлади."
-    )
+    await call.answer("Текширяпман...")
+    await check_payments_once()
+    # After one check, show status
+    if str(oid) in STATE["paid"]:
+        await call.message.answer(f"✅ Заказ #{oid} тасдиқланди.", reply_markup=main_menu())
+    else:
+        await call.message.answer("⏳ Ҳали тушмади ёки confirmations кам. Кейинроқ қайта текширинг.", reply_markup=main_menu())
+
+
+@dp.callback_query_handler(lambda c: c.data == "my_orders")
+async def my_orders(call: types.CallbackQuery):
+    text = find_user_orders_text(call.from_user.id)
     try:
-        await call.message.edit_text(text, reply_markup=pay_back_kb(pid))
-    except MessageNotModified:
-        pass
-    await call.answer()
-
-
-@dp.callback_query_handler(lambda c: c.data == "pay_ltc")
-async def pay_ltc_general(call: types.CallbackQuery):
-    text = (
-        "💳 Litecoin тўлов\n\n"
-        f"Адрес:\n{LTC_WALLET}\n\n"
-        "Тўловдан кейин TXID юборинг."
-    )
-    try:
-        await call.message.edit_text(text, reply_markup=back_menu())
+        await call.message.edit_text(text, reply_markup=back_main_kb())
     except MessageNotModified:
         pass
     await call.answer()
@@ -306,7 +494,7 @@ async def exchange(call: types.CallbackQuery):
         "⚠️ Фақат ишончли P2P сотувчилардан фойдаланинг."
     )
     try:
-        await call.message.edit_text(text, reply_markup=back_menu())
+        await call.message.edit_text(text, reply_markup=back_main_kb())
     except MessageNotModified:
         pass
     await call.answer()
@@ -315,97 +503,33 @@ async def exchange(call: types.CallbackQuery):
 @dp.callback_query_handler(lambda c: c.data == "contact")
 async def contact(call: types.CallbackQuery):
     await call.answer()
-    await call.message.answer(
-        "☎️ Алоқа:\nАдмин билан боғланиш учун хабар ёзинг.",
-        reply_markup=back_menu()
-    )
+    await call.message.answer("☎️ Алоқа:\nАдмин билан боғланиш учун хабар ёзинг.", reply_markup=back_main_kb())
 
 
 @dp.message_handler()
-async def handle_text(message: types.Message):
-    uid = message.from_user.id
-    text = (message.text or "").strip()
-
-    # TXID flow
-    if uid in WAITING_TXID:
-        state = WAITING_TXID[uid]
-        pid = state["pid"]
-        created_at = int(state["created_at"])
-        p = PRODUCTS.get(pid)
-
-        if not TXID_RE.match(text):
-            await message.answer("TXID формати нотўғри (64 hex). Қайта юборинг:", reply_markup=main_menu())
-            return
-
-        if text in USED_TXIDS:
-            await message.answer("❌ Бу TXID аввал ишлатилган.", reply_markup=main_menu())
-            return
-
-        # Verify via BlockCypher
-        try:
-            res = await verify_txid(text, LTC_WALLET, created_at=created_at)
-        except Exception as e:
-            await message.answer(
-                f"Текширувда хато: {e}\n"
-                "Бироздан кейин қайта уриниб кўринг ёки /check <TXID> қилинг.",
-                reply_markup=main_menu()
-            )
-            return
-
-        if res.get("ok"):
-            USED_TXIDS.add(text)
-            WAITING_TXID.pop(uid, None)
-
-            await message.answer(
-                "✅ Тўлов тасдиқланди.\n"
-                f"Товар: {p['name'] if p else pid}\n"
-                f"Confirmations: {res.get('confirmations')}\n\n"
-                "Кейинги қадамда автомат етказиш/контент беришни қўшамиз.",
-                reply_markup=main_menu()
-            )
-
-            # Optional: admin log only
-            if isinstance(ADMIN_ID, int) and ADMIN_ID != 0:
-                try:
-                    await bot.send_message(
-                        ADMIN_ID,
-                        f"✅ AUTO-PAID\nUser: {uid}\nProduct: {p['name'] if p else pid}\nTXID: {text}\nConfs: {res.get('confirmations')}"
-                    )
-                except Exception:
-                    pass
-            return
-
-        # Not ok cases
-        reason = res.get("reason")
-        if reason == "not_confirmed_yet":
-            await message.answer(
-                f"⏳ TX топилди, лекин confirmations кам: {res.get('confirmations', 0)}.\n"
-                "Кутинг ва /check <TXID> билан қайта текширинг.",
-                reply_markup=main_menu()
-            )
-            return
-        if reason == "not_to_our_address":
-            await message.answer("❌ Бу TX сенинг тўлов адресингга тушмаган. Қайта текширинг.", reply_markup=main_menu())
-            return
-        if reason == "double_spend":
-            await message.answer("❌ Double-spend TX. Қабул қилинмайди.", reply_markup=main_menu())
-            return
-
-        await message.answer("❌ TX текширувдан ўтмади.", reply_markup=main_menu())
-        return
-
-    # Normal message -> admin forward + ack
+async def any_text(message: types.Message):
+    # normal chat forward to admin (optional)
     if isinstance(ADMIN_ID, int) and ADMIN_ID != 0:
         try:
-            await bot.send_message(ADMIN_ID, f"📩 User {uid}:\n{text}")
+            await bot.send_message(ADMIN_ID, f"📩 User {message.from_user.id}:\n{message.text}")
         except Exception:
             pass
+    await message.answer("Менюдан фойдаланинг:", reply_markup=main_menu())
 
-    await message.answer("Қабул қилинди ✅", reply_markup=main_menu())
+
+async def on_startup(_dp: Dispatcher):
+    load_state()
+    if not LTC_WALLET:
+        raise RuntimeError("LTC_WALLET env йўқ")
+
+    # Start background payments loop
+    asyncio.create_task(payments_loop())
+    logging.info("Started payments loop")
 
 
-async def on_shutdown(dp: Dispatcher):
+async def on_shutdown(_dp: Dispatcher):
     global http
+    save_state()
     if http and not http.closed:
         await http.close()
 
@@ -413,6 +537,4 @@ async def on_shutdown(dp: Dispatcher):
 if __name__ == "__main__":
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN env йўқ")
-    if not LTC_WALLET:
-        raise RuntimeError("LTC_WALLET env йўқ")
-    executor.start_polling(dp, skip_updates=True, on_shutdown=on_shutdown)
+    executor.start_polling(dp, skip_updates=True, on_startup=on_startup, on_shutdown=on_shutdown)
