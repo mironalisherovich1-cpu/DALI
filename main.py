@@ -25,14 +25,14 @@ async def start(message: types.Message):
 
 @dp.callback_query_handler(lambda c: c.data == "products")
 async def products(call: types.CallbackQuery):
+    text = (
+        "🛍 Товарлар:\n"
+        "1) Product A — 10$\n"
+        "2) Product B — 25$\n\n"
+        "Сотиб олиш механикасини кейинги қадамда қўшамиз."
+    )
     try:
-        await call.message.edit_text(
-            "🛍 Товарлар:\n"
-            "1) Product A — 10$\n"
-            "2) Product B — 25$\n\n"
-            "Сотиб олиш механикасини кейинги қадамда қўшамиз.",
-            reply_markup=menu(),
-        )
+        await call.message.edit_text(text, reply_markup=menu())
     except MessageNotModified:
         pass
     await call.answer()
@@ -54,19 +54,20 @@ async def pay_ltc(call: types.CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data == "contact")
 async def contact(call: types.CallbackQuery):
-    try:
-        await call.message.edit_text("☎️ Алоқа: админ", reply_markup=menu())
-    except MessageNotModified:
-        pass
+    # Edit билан эмас — янги хабар билан чиқарамиз (100% ишлайди)
     await call.answer()
+    await call.message.answer("☎️ Алоқа: админ", reply_markup=menu())
 
 
 @dp.message_handler()
 async def forward_to_admin(message: types.Message):
-    # Админга форвард (ADMIN_ID рақам бўлиши шарт)
+    # Админга форвард (ADMIN_ID фақат рақам бўлиши шарт)
     if isinstance(ADMIN_ID, int) and ADMIN_ID != 0:
         try:
-            await bot.send_message(ADMIN_ID, f"📩 User {message.from_user.id}:\n{message.text}")
+            await bot.send_message(
+                ADMIN_ID,
+                f"📩 User {message.from_user.id}:\n{message.text}"
+            )
         except Exception:
             pass
 
@@ -75,7 +76,7 @@ async def forward_to_admin(message: types.Message):
 
 if __name__ == "__main__":
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN env йўқ")
+        raise RuntimeError("BOT_TOKEN env йўқ (Railway Variables'га қўй)")
     if not LTC_WALLET:
         logging.warning("LTC_WALLET env йўқ — 'Тўлов (LTC)' бўлимида адрес чиқмайди.")
     executor.start_polling(dp, skip_updates=True)
