@@ -1,540 +1,817 @@
-import asyncio
-import json
-import logging
 import os
-import random
+import re
+import json
 import time
-from decimal import Decimal, ROUND_DOWN
-from typing import Dict, Any, Optional, List
+import math
+import random
+import sqlite3
+import asyncio
+from dataclasses import dataclass
+from typing import Optional, List, Tuple, Dict
 
 import aiohttp
-from aiogram import Bot, Dispatcher, executor, types
-from aiogram.utils.exceptions import MessageNotModified
-
-from config import BOT_TOKEN, ADMIN_ID, LTC_WALLET
-
-logging.basicConfig(level=logging.INFO)
-
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
-
-# =========================
-# SETTINGS
-# =========================
-REQUIRED_CONFIRMATIONS = 1
-POLL_INTERVAL_SEC = 30
-
-# Unique amount "salt" (in litoshi): 1 litoshi = 0.00000001 LTC
-# We'll add 700..9900 litoshi (~0.00000700..0.00009900 LTC) to make each invoice unique.
-SALT_MIN_LITOSHI = 700
-SALT_MAX_LITOSHI = 9900
-
-# Persist state to file (Railway container may restart; this helps when it doesn't wipe)
-STATE_FILE = "state.json"
-
-# BlockCypher (optional token for higher limits)
-BLOCKCYPHER_TOKEN = os.getenv("BLOCKCYPHER_TOKEN", "").strip()
-BC_BASE = "https://api.blockcypher.com/v1/ltc/main"
-
-# CoinGecko rate (free, no key typically)
-COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currencies=usd"
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart, Command
+from aiogram.types import (
+    Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton
+)
+from aiogram.exceptions import TelegramBadRequest
 
 
 # =========================
-# PRODUCTS
+# CONFIG
 # =========================
-PRODUCTS = {
-    "1": {"name": "GSH MAROCCO 0.5", "price_usd": 25},
-    "2": {"name": "GSH MAROCCO 1", "price_usd": 45},
-}
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+LTC_ADDRESS = os.getenv("LTC_ADDRESS", "").strip()
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()}
+
+DEFAULT_USD_PER_LTC = float(os.getenv("DEFAULT_USD_PER_LTC", "100") or "100")
+DB_PATH = os.getenv("DB_PATH", "shop.sqlite3")
+
+# Payment checking
+CHECK_INTERVAL_SEC = 45
+MIN_CONFIRMATIONS = 1
+# amount matching tolerance in LTC (very small)
+AMOUNT_TOL_LTC = 0.00000001  # 1 litoshi
+
+# SoChain endpoints (Litecoin)
+SOCHAIN_RECEIVED = "https://sochain.com/api/v2/get_tx_received/LTC/{address}"
+SOCHAIN_TX = "https://sochain.com/api/v2/get_tx/LTC/{txid}"
+
+# Price rate endpoint (CoinGecko)
+COINGECKO_RATE = "https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currencies=usd"
 
 
 # =========================
-# STATE
+# DB
 # =========================
-STATE: Dict[str, Any] = {
-    "order_seq": 0,
-    "pending": {},   # order_id(str) -> order dict
-    "paid": {},      # order_id(str) -> order dict
-    "seen_tx": [],   # list of tx_hash already counted (best-effort)
-}
+def db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-http: Optional[aiohttp.ClientSession] = None
+def init_db():
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS users(
+            tg_id INTEGER PRIMARY KEY,
+            balance_usd REAL NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS products(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL,
+            price_usd REAL NOT NULL,
+            stock INTEGER NOT NULL DEFAULT 0,
+            is_active INTEGER NOT NULL DEFAULT 1
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS orders(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tg_id INTEGER NOT NULL,
+            product_id INTEGER NOT NULL,
+            qty INTEGER NOT NULL,
+            amount_usd REAL NOT NULL,
+            usd_per_ltc REAL NOT NULL,
+            amount_ltc REAL NOT NULL,
+            status TEXT NOT NULL, -- pending|paid|delivered|cancelled|expired
+            created_at INTEGER NOT NULL,
+            paid_at INTEGER,
+            txid TEXT,
+            UNIQUE(tg_id, id)
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS seen_tx(
+            txid TEXT PRIMARY KEY,
+            seen_at INTEGER NOT NULL
+        )
+        """)
+        conn.commit()
+
+def ensure_user(tg_id: int):
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT tg_id FROM users WHERE tg_id=?", (tg_id,))
+        if cur.fetchone() is None:
+            cur.execute(
+                "INSERT INTO users(tg_id, balance_usd, created_at) VALUES(?,?,?)",
+                (tg_id, 0.0, int(time.time()))
+            )
+            conn.commit()
+
+def get_balance(tg_id: int) -> float:
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT balance_usd FROM users WHERE tg_id=?", (tg_id,))
+        row = cur.fetchone()
+        return float(row["balance_usd"]) if row else 0.0
+
+def add_balance(tg_id: int, usd: float):
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE users SET balance_usd = balance_usd + ? WHERE tg_id=?", (usd, tg_id))
+        conn.commit()
+
+def deduct_balance(tg_id: int, usd: float) -> bool:
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT balance_usd FROM users WHERE tg_id=?", (tg_id,))
+        row = cur.fetchone()
+        if not row:
+            return False
+        bal = float(row["balance_usd"])
+        if bal + 1e-9 < usd:
+            return False
+        cur.execute("UPDATE users SET balance_usd = balance_usd - ? WHERE tg_id=?", (usd, tg_id))
+        conn.commit()
+        return True
+
+def list_products(active_only=True) -> List[sqlite3.Row]:
+    with db() as conn:
+        cur = conn.cursor()
+        if active_only:
+            cur.execute("SELECT * FROM products WHERE is_active=1 ORDER BY id DESC")
+        else:
+            cur.execute("SELECT * FROM products ORDER BY id DESC")
+        return cur.fetchall()
+
+def get_product(pid: int) -> Optional[sqlite3.Row]:
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM products WHERE id=?", (pid,))
+        return cur.fetchone()
+
+def add_product(name: str, description: str, price_usd: float, stock: int):
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO products(name, description, price_usd, stock, is_active) VALUES(?,?,?,?,1)",
+            (name, description, price_usd, stock)
+        )
+        conn.commit()
+
+def delete_product(pid: int):
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE products SET is_active=0 WHERE id=?", (pid,))
+        conn.commit()
+
+def reduce_stock(pid: int, qty: int) -> bool:
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT stock FROM products WHERE id=? AND is_active=1", (pid,))
+        row = cur.fetchone()
+        if not row:
+            return False
+        stock = int(row["stock"])
+        if stock < qty:
+            return False
+        cur.execute("UPDATE products SET stock = stock - ? WHERE id=?", (qty, pid))
+        conn.commit()
+        return True
+
+def create_order(tg_id: int, pid: int, qty: int, amount_usd: float, usd_per_ltc: float, amount_ltc: float) -> int:
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO orders(tg_id, product_id, qty, amount_usd, usd_per_ltc, amount_ltc, status, created_at)
+            VALUES(?,?,?,?,?,?, 'pending', ?)
+        """, (tg_id, pid, qty, amount_usd, usd_per_ltc, amount_ltc, int(time.time())))
+        conn.commit()
+        return int(cur.lastrowid)
+
+def list_user_orders(tg_id: int, limit: int = 10) -> List[sqlite3.Row]:
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT o.*, p.name as product_name
+            FROM orders o JOIN products p ON p.id=o.product_id
+            WHERE o.tg_id=?
+            ORDER BY o.id DESC
+            LIMIT ?
+        """, (tg_id, limit))
+        return cur.fetchall()
+
+def get_order(order_id: int) -> Optional[sqlite3.Row]:
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT o.*, p.name as product_name, p.description as product_desc
+            FROM orders o JOIN products p ON p.id=o.product_id
+            WHERE o.id=?
+        """, (order_id,))
+        return cur.fetchone()
+
+def mark_order_paid(order_id: int, txid: str):
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE orders
+            SET status='paid', paid_at=?, txid=?
+            WHERE id=? AND status='pending'
+        """, (int(time.time()), txid, order_id))
+        conn.commit()
+
+def mark_order_delivered(order_id: int):
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE orders SET status='delivered' WHERE id=? AND status='paid'", (order_id,))
+        conn.commit()
+
+def get_pending_orders(limit: int = 50) -> List[sqlite3.Row]:
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT o.*
+            FROM orders o
+            WHERE o.status='pending'
+            ORDER BY o.created_at ASC
+            LIMIT ?
+        """, (limit,))
+        return cur.fetchall()
+
+def tx_seen(txid: str) -> bool:
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT txid FROM seen_tx WHERE txid=?", (txid,))
+        return cur.fetchone() is not None
+
+def mark_tx_seen(txid: str):
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT OR IGNORE INTO seen_tx(txid, seen_at) VALUES(?,?)", (txid, int(time.time())))
+        conn.commit()
 
 
-def load_state():
-    global STATE
+# =========================
+# UI
+# =========================
+def main_menu_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🛒 Shop"), KeyboardButton(text="💰 Balance")],
+            [KeyboardButton(text="📦 My Orders"), KeyboardButton(text="ℹ️ Info")]
+        ],
+        resize_keyboard=True
+    )
+
+def admin_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Add product", callback_data="admin:add")],
+        [InlineKeyboardButton(text="📦 List products", callback_data="admin:list")],
+        [InlineKeyboardButton(text="❌ Disable product", callback_data="admin:del")],
+        [InlineKeyboardButton(text="➕ Add balance (manual)", callback_data="admin:bal")],
+        [InlineKeyboardButton(text="📊 Stats", callback_data="admin:stats")],
+    ])
+
+def products_kb() -> InlineKeyboardMarkup:
+    rows = []
+    for p in list_products(active_only=True)[:20]:
+        rows.append([InlineKeyboardButton(
+            text=f"#{p['id']} • {p['name']} • ${p['price_usd']:.2f} • stock:{p['stock']}",
+            callback_data=f"p:{p['id']}"
+        )])
+    rows.append([InlineKeyboardButton(text="🔄 Refresh", callback_data="shop:refresh")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def product_card_kb(pid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Buy 1", callback_data=f"buy:{pid}:1")],
+        [InlineKeyboardButton(text="⬅️ Back", callback_data="shop:back")]
+    ])
+
+def order_kb(order_id: int, is_admin: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="🔄 Check payment", callback_data=f"order:check:{order_id}")],
+        [InlineKeyboardButton(text="⬅️ Back to Shop", callback_data="shop:back")]
+    ]
+    if is_admin:
+        rows.insert(0, [InlineKeyboardButton(text="📦 Mark delivered", callback_data=f"admin:deliver:{order_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# =========================
+# PAYMENT LOGIC
+# =========================
+async def get_usd_per_ltc(session: aiohttp.ClientSession) -> float:
     try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                STATE = json.load(f)
-    except Exception as e:
-        logging.warning(f"Failed to load state: {e}")
+        async with session.get(COINGECKO_RATE, timeout=10) as r:
+            data = await r.json()
+            usd = float(data["litecoin"]["usd"])
+            if usd > 0:
+                return usd
+    except Exception:
+        pass
+    return DEFAULT_USD_PER_LTC
 
-
-def save_state():
-    try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(STATE, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logging.warning(f"Failed to save state: {e}")
-
-
-def new_order_id() -> int:
-    STATE["order_seq"] = int(STATE.get("order_seq", 0)) + 1
-    save_state()
-    return STATE["order_seq"]
-
-
-def ltc_to_litoshi(ltc: Decimal) -> int:
-    # 1 LTC = 100,000,000 litoshi
-    return int((ltc * Decimal("100000000")).to_integral_value(rounding=ROUND_DOWN))
-
-
-def litoshi_to_ltc_str(litoshi: int) -> str:
-    ltc = Decimal(litoshi) / Decimal("100000000")
-    # show up to 8 decimals
-    s = f"{ltc:.8f}"
-    # trim trailing zeros
-    s = s.rstrip("0").rstrip(".")
-    return s
-
-
-async def get_http() -> aiohttp.ClientSession:
-    global http
-    if http is None or http.closed:
-        http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
-    return http
-
-
-def bc_url(path: str) -> str:
-    url = f"{BC_BASE}{path}"
-    if BLOCKCYPHER_TOKEN:
-        joiner = "&" if "?" in url else "?"
-        url = f"{url}{joiner}token={BLOCKCYPHER_TOKEN}"
-    return url
-
-
-async def fetch_json(url: str) -> Dict[str, Any]:
-    session = await get_http()
-    async with session.get(url) as r:
-        txt = await r.text()
-        if r.status != 200:
-            raise RuntimeError(f"HTTP {r.status}: {txt[:300]}")
-        try:
-            return json.loads(txt)
-        except Exception:
-            raise RuntimeError(f"Non-JSON response: {txt[:200]}")
-
-
-async def get_ltc_usd_rate() -> Decimal:
+def make_unique_ltc_amount(base_ltc: float) -> float:
     """
-    Returns: 1 LTC in USD
+    To match payments on a single merchant address, we add a tiny random litoshi offset.
     """
-    data = await fetch_json(COINGECKO_URL)
-    usd = data.get("litecoin", {}).get("usd")
-    if usd is None:
-        raise RuntimeError("Rate not found")
-    return Decimal(str(usd))
+    litoshis = int(round(base_ltc * 1e8))
+    offset = random.randint(1, 50)  # 1..50 litoshi
+    return (litoshis + offset) / 1e8
 
-
-async def get_chain_height() -> int:
-    data = await fetch_json(bc_url(""))
-    h = data.get("height")
-    if not isinstance(h, int):
-        raise RuntimeError("Chain height not found")
-    return h
-
-
-def confirmations_from_tx(tx: Dict[str, Any], chain_height: int) -> int:
-    conf = tx.get("confirmations")
-    if isinstance(conf, int):
-        return conf
-    bh = tx.get("block_height")
-    if isinstance(bh, int) and bh >= 0:
-        return max(0, (chain_height - bh + 1))
-    return 0
-
-
-def total_paid_to_address_litoshi(tx: Dict[str, Any], addr: str) -> int:
-    total = 0
-    for out in tx.get("outputs", []) or []:
-        addrs = out.get("addresses") or []
-        if addr in addrs:
-            v = out.get("value")
-            if isinstance(v, int) and v > 0:
-                total += v
-    return total
-
-
-async def fetch_recent_txs_for_address(addr: str, limit: int = 50) -> List[Dict[str, Any]]:
-    # /addrs/<addr>/full returns txs (may be heavy; limit helps)
-    data = await fetch_json(bc_url(f"/addrs/{addr}/full?limit={limit}"))
-    txs = data.get("txs") or []
-    if not isinstance(txs, list):
+async def fetch_received_txs(session: aiohttp.ClientSession) -> List[Dict]:
+    """
+    Returns list of received txs at LTC_ADDRESS from SoChain.
+    """
+    url = SOCHAIN_RECEIVED.format(address=LTC_ADDRESS)
+    async with session.get(url, timeout=15) as r:
+        j = await r.json()
+    if j.get("status") != "success":
         return []
-    return txs
+    return j["data"].get("txs", [])
 
+async def fetch_tx_details(session: aiohttp.ClientSession, txid: str) -> Optional[Dict]:
+    url = SOCHAIN_TX.format(txid=txid)
+    async with session.get(url, timeout=15) as r:
+        j = await r.json()
+    if j.get("status") != "success":
+        return None
+    return j.get("data")
 
-# =========================
-# KEYBOARDS
-# =========================
-def main_menu():
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(types.InlineKeyboardButton("🛍 Товарлар", callback_data="products"))
-    kb.add(types.InlineKeyboardButton("📦 Менинг заказларим", callback_data="my_orders"))
-    kb.add(types.InlineKeyboardButton("🔄 Обменники", callback_data="exchange"))
-    kb.add(types.InlineKeyboardButton("☎️ Алоқа", callback_data="contact"))
-    return kb
-
-
-def back_main_kb():
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(types.InlineKeyboardButton("⬅️ Орқа (Бош меню)", callback_data="back"))
-    return kb
-
-
-def products_kb():
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(types.InlineKeyboardButton("1) GSH MAROCCO 0.5 — 25$", callback_data="buy_1"))
-    kb.add(types.InlineKeyboardButton("2) GSH MAROCCO 1 — 45$", callback_data="buy_2"))
-    kb.add(types.InlineKeyboardButton("⬅️ Орқа (Бош меню)", callback_data="back"))
-    return kb
-
-
-def invoice_kb(order_id: int):
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(types.InlineKeyboardButton("🔄 Текшириш (ҳозир)", callback_data=f"check_{order_id}"))
-    kb.add(types.InlineKeyboardButton("🏠 Бош меню", callback_data="back"))
-    return kb
-
-
-# =========================
-# ORDER HELPERS
-# =========================
-def make_order(user: types.User, pid: str, need_litoshi: int, salt_litoshi: int) -> Dict[str, Any]:
-    oid = new_order_id()
-    p = PRODUCTS[pid]
-    order = {
-        "order_id": oid,
-        "user_id": user.id,
-        "username": user.username,
-        "pid": pid,
-        "product_name": p["name"],
-        "price_usd": p["price_usd"],
-        "need_litoshi": need_litoshi,
-        "salt_litoshi": salt_litoshi,
-        "total_litoshi": need_litoshi + salt_litoshi,
-        "address": LTC_WALLET,
-        "status": "PENDING",
-        "created_at": int(time.time()),
-        "paid_tx": None,
-        "confirmations": 0,
-    }
-    return order
-
-
-def store_pending(order: Dict[str, Any]):
-    STATE["pending"][str(order["order_id"])] = order
-    save_state()
-
-
-def mark_paid(order_id: int, tx_hash: str, confirmations: int):
-    oid = str(order_id)
-    order = STATE["pending"].get(oid)
-    if not order:
-        return
-    order["status"] = "PAID"
-    order["paid_tx"] = tx_hash
-    order["confirmations"] = confirmations
-    STATE["paid"][oid] = order
-    STATE["pending"].pop(oid, None)
-    save_state()
-
-
-def find_user_orders_text(user_id: int) -> str:
-    pend = [o for o in STATE["pending"].values() if o.get("user_id") == user_id]
-    paid = [o for o in STATE["paid"].values() if o.get("user_id") == user_id]
-
-    lines = []
-    if not pend and not paid:
-        return "Сизда ҳали заказ йўқ."
-
-    if pend:
-        lines.append("⏳ Pending заказлар:")
-        for o in sorted(pend, key=lambda x: x.get("order_id", 0)):
-            lines.append(
-                f"• #{o['order_id']} — {o['product_name']} — {o['price_usd']}$ — "
-                f"{litoshi_to_ltc_str(o['total_litoshi'])} LTC"
-            )
-    if paid:
-        lines.append("\n✅ Тасдиқланган заказлар:")
-        for o in sorted(paid, key=lambda x: x.get("order_id", 0)):
-            lines.append(
-                f"• #{o['order_id']} — {o['product_name']} — PAID (conf: {o.get('confirmations', 0)})"
-            )
-    return "\n".join(lines)
-
-
-# =========================
-# BACKGROUND PAYMENT CHECK
-# =========================
-async def check_payments_once():
+def tx_pays_exact_amount_to_address(tx_data: Dict, address: str, expected_ltc: float) -> bool:
     """
-    Pull recent txs to LTC_WALLET and match against pending orders by total_litoshi.
+    Validate tx has output to 'address' with amount ~ expected_ltc.
+    SoChain tx data includes outputs with 'address' and 'value' (as string).
     """
-    if not LTC_WALLET:
-        return
-    if not STATE["pending"]:
-        return
-
-    try:
-        chain_h = await get_chain_height()
-        txs = await fetch_recent_txs_for_address(LTC_WALLET, limit=50)
-    except Exception as e:
-        logging.warning(f"Payment check failed: {e}")
-        return
-
-    seen_tx = set(STATE.get("seen_tx", []))
-    pending_orders = list(STATE["pending"].values())
-
-    # Build lookup by expected amount
-    by_amount: Dict[int, List[Dict[str, Any]]] = {}
-    for o in pending_orders:
-        by_amount.setdefault(int(o["total_litoshi"]), []).append(o)
-
-    for tx in txs:
-        tx_hash = tx.get("hash")
-        if not isinstance(tx_hash, str):
-            continue
-
-        paid_litoshi = total_paid_to_address_litoshi(tx, LTC_WALLET)
-        if paid_litoshi <= 0:
-            continue
-
-        # match only if exact amount matches a pending order
-        if paid_litoshi not in by_amount:
-            continue
-
-        conf = confirmations_from_tx(tx, chain_h)
-        if conf < REQUIRED_CONFIRMATIONS:
-            continue
-
-        # Prevent counting same tx multiple times (best-effort)
-        if tx_hash in seen_tx:
-            continue
-
-        # Choose the oldest pending order with that amount
-        candidates = sorted(by_amount[paid_litoshi], key=lambda x: x.get("created_at", 0))
-        if not candidates:
-            continue
-
-        order = candidates[0]
-        order_id = int(order["order_id"])
-        user_id = int(order["user_id"])
-
-        # Mark paid
-        mark_paid(order_id, tx_hash, conf)
-
-        # Remember tx
-        seen_tx.add(tx_hash)
-        STATE["seen_tx"] = list(seen_tx)[-500:]  # keep last 500
-        save_state()
-
-        # Notify user
-        try:
-            await bot.send_message(
-                user_id,
-                f"✅ Тўлов автоматик тасдиқланди.\n"
-                f"Заказ #{order_id}\n"
-                f"Товар: {order['product_name']}\n"
-                f"Тушган сумма: {litoshi_to_ltc_str(paid_litoshi)} LTC\n"
-                f"Confirmations: {conf}\n\n"
-                f"🏠 Бош меню: /start",
-                reply_markup=main_menu()
-            )
-        except Exception as e:
-            logging.warning(f"Notify user failed: {e}")
-
-        # Optional admin info
-        if isinstance(ADMIN_ID, int) and ADMIN_ID != 0:
+    outputs = tx_data.get("outputs", [])
+    for out in outputs:
+        if out.get("address") == address:
             try:
-                await bot.send_message(
-                    ADMIN_ID,
-                    f"✅ AUTO-CONFIRM\nOrder #{order_id}\nUser: {user_id}\n"
-                    f"Amount: {litoshi_to_ltc_str(paid_litoshi)} LTC\nTX: {tx_hash}"
-                )
+                v = float(out.get("value"))
             except Exception:
-                pass
+                continue
+            if abs(v - expected_ltc) <= AMOUNT_TOL_LTC:
+                return True
+    return False
 
-
-async def payments_loop():
-    while True:
-        await check_payments_once()
-        await asyncio.sleep(POLL_INTERVAL_SEC)
+def get_confirmations(tx_data: Dict) -> int:
+    try:
+        return int(tx_data.get("confirmations", 0))
+    except Exception:
+        return 0
 
 
 # =========================
-# HANDLERS
+# ADMIN STATE (simple, in-memory)
 # =========================
-@dp.message_handler(commands=["start"])
-async def start(message: types.Message):
-    await message.answer("✅ Бот ишлаяпти.\nБош меню:", reply_markup=main_menu())
+@dataclass
+class AdminDraft:
+    step: str
+    payload: dict
+
+ADMIN_DRAFTS: Dict[int, AdminDraft] = {}  # tg_id -> draft
 
 
-@dp.callback_query_handler(lambda c: c.data == "back")
-async def back(call: types.CallbackQuery):
-    try:
-        await call.message.edit_text("🏠 Бош меню:", reply_markup=main_menu())
-    except MessageNotModified:
-        pass
-    await call.answer()
+def is_admin(tg_id: int) -> bool:
+    return tg_id in ADMIN_IDS
 
 
-@dp.callback_query_handler(lambda c: c.data == "products")
-async def products(call: types.CallbackQuery):
-    try:
-        await call.message.edit_text("🛍 Товарлар (танланг):", reply_markup=products_kb())
-    except MessageNotModified:
-        pass
-    await call.answer()
+# =========================
+# BOT
+# =========================
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
 
 
-@dp.callback_query_handler(lambda c: c.data.startswith("buy_"))
-async def buy(call: types.CallbackQuery):
-    pid = call.data.split("_", 1)[1]
-    if pid not in PRODUCTS:
-        await call.answer("Товар топилмади", show_alert=True)
-        return
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
+    ensure_user(message.from_user.id)
 
-    p = PRODUCTS[pid]
+    txt = (
+        "✅ Bot ishga tushdi.\n\n"
+        "🛒 Shop — tovarlar\n"
+        "💰 Balance — balans\n"
+        "📦 My Orders — buyurtmalar\n"
+    )
+    await message.answer(txt, reply_markup=main_menu_kb())
 
-    # 1) get rate
-    try:
-        ltc_usd = await get_ltc_usd_rate()  # 1 LTC in USD
-    except Exception as e:
-        await call.answer()
-        await call.message.answer(f"Курсни олишда хато: {e}", reply_markup=main_menu())
-        return
 
-    # 2) compute needed LTC (USD / (USD per LTC))
-    usd = Decimal(str(p["price_usd"]))
-    need_ltc = (usd / ltc_usd)
+@dp.message(Command("admin"))
+async def cmd_admin(message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.answer("❌ Admin emas.")
+    await message.answer("🧑‍💼 Admin panel:", reply_markup=None)
+    await message.answer("Tanlang:", reply_markup=admin_menu_kb())
 
-    # round DOWN to 8 decimals in litoshi
-    need_litoshi = ltc_to_litoshi(need_ltc)
 
-    # 3) add salt
-    salt_litoshi = random.randint(SALT_MIN_LITOSHI, SALT_MAX_LITOSHI)
+@dp.message(F.text == "🛒 Shop")
+async def shop(message: Message):
+    if not LTC_ADDRESS:
+        return await message.answer("❌ LTC_ADDRESS sozlanmagan (Railway Variables).")
+    items = list_products(active_only=True)
+    if not items:
+        return await message.answer("Hozircha tovar yo‘q.")
+    await message.answer("🛒 Vitrina:", reply_markup=None)
+    await message.answer("Tovar tanlang:", reply_markup=products_kb())
 
-    order = make_order(call.from_user, pid, need_litoshi, salt_litoshi)
-    store_pending(order)
 
-    total_ltc_str = litoshi_to_ltc_str(order["total_litoshi"])
-    rate_str = f"{ltc_usd:.2f}"
+@dp.message(F.text == "💰 Balance")
+async def balance(message: Message):
+    ensure_user(message.from_user.id)
+    bal = get_balance(message.from_user.id)
+    await message.answer(f"💰 Balans: ${bal:.2f}", reply_markup=main_menu_kb())
 
-    text = (
-        "🧾 Invoice (TXID керак эмас)\n\n"
-        f"Заказ #{order['order_id']}\n"
-        f"Товар: {order['product_name']}\n"
-        f"Нарх: {order['price_usd']}$\n"
-        f"Курс: 1 LTC = {rate_str} USD\n\n"
-        f"✅ Тўлашингиз керак бўлган сумма (аниқ):\n"
-        f"**{total_ltc_str} LTC**\n\n"
-        f"📩 Адрес:\n{LTC_WALLET}\n\n"
-        f"⚠️ Фақат шу аниқ суммани юборинг.\n"
-        f"Тушиши билан бот автоматик тасдиқлайди (conf ≥ {REQUIRED_CONFIRMATIONS})."
+
+@dp.message(F.text == "📦 My Orders")
+async def my_orders(message: Message):
+    ensure_user(message.from_user.id)
+    orders = list_user_orders(message.from_user.id, limit=10)
+    if not orders:
+        return await message.answer("📦 Buyurtmalar yo‘q.")
+    lines = ["📦 Oxirgi buyurtmalar:"]
+    for o in orders:
+        lines.append(f"#{o['id']} • {o['product_name']} x{o['qty']} • ${o['amount_usd']:.2f} • {o['status']}")
+    await message.answer("\n".join(lines))
+
+
+@dp.message(F.text == "ℹ️ Info")
+async def info(message: Message):
+    await message.answer(
+        "ℹ️ To‘lov: LTC\n"
+        "Bot buyurtma uchun aniq LTC miqdorni beradi.\n"
+        "To‘lov kelgach avtomatik tasdiqlanadi."
     )
 
+
+# ---------- Callbacks (Shop) ----------
+@dp.callback_query(F.data == "shop:refresh")
+async def cb_refresh(call: CallbackQuery):
+    await call.message.edit_reply_markup(reply_markup=products_kb())
+    await call.answer("Refreshed")
+
+@dp.callback_query(F.data == "shop:back")
+async def cb_back(call: CallbackQuery):
     try:
-        await call.message.edit_text(text, reply_markup=invoice_kb(order["order_id"]), parse_mode="Markdown")
-    except MessageNotModified:
-        pass
+        await call.message.edit_text("🛒 Vitrina:", reply_markup=products_kb())
+    except TelegramBadRequest:
+        await call.message.answer("🛒 Vitrina:", reply_markup=products_kb())
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("p:"))
+async def cb_product(call: CallbackQuery):
+    pid = int(call.data.split(":")[1])
+    p = get_product(pid)
+    if not p or int(p["is_active"]) != 1:
+        return await call.answer("Topilmadi", show_alert=True)
+    txt = (
+        f"🧾 Tovar: {p['name']}\n"
+        f"💵 Narx: ${float(p['price_usd']):.2f}\n"
+        f"📦 Stock: {int(p['stock'])}\n\n"
+        f"{p['description']}"
+    )
+    await call.message.edit_text(txt, reply_markup=product_card_kb(pid))
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("buy:"))
+async def cb_buy(call: CallbackQuery):
+    if not LTC_ADDRESS:
+        return await call.answer("LTC_ADDRESS sozlanmagan", show_alert=True)
+
+    ensure_user(call.from_user.id)
+
+    _, pid_s, qty_s = call.data.split(":")
+    pid = int(pid_s)
+    qty = int(qty_s)
+
+    p = get_product(pid)
+    if not p or int(p["is_active"]) != 1:
+        return await call.answer("Tovar topilmadi", show_alert=True)
+    if int(p["stock"]) < qty:
+        return await call.answer("Stock yetarli emas", show_alert=True)
+
+    amount_usd = float(p["price_usd"]) * qty
+
+    async with aiohttp.ClientSession() as session:
+        usd_per_ltc = await get_usd_per_ltc(session)
+
+    base_ltc = amount_usd / usd_per_ltc
+    amount_ltc = make_unique_ltc_amount(base_ltc)
+
+    # Create order
+    order_id = create_order(
+        tg_id=call.from_user.id,
+        pid=pid,
+        qty=qty,
+        amount_usd=amount_usd,
+        usd_per_ltc=usd_per_ltc,
+        amount_ltc=amount_ltc
+    )
+
+    txt = (
+        f"🧾 Order #{order_id}\n"
+        f"📦 {p['name']} x{qty}\n"
+        f"💵 ${amount_usd:.2f}\n\n"
+        f"✅ To‘lov uchun:\n"
+        f"➡️ Address: `{LTC_ADDRESS}`\n"
+        f"➡️ Amount: *{amount_ltc:.8f} LTC*\n\n"
+        f"⚠️ Aynan shu miqdorni yuboring (unikal).\n"
+        f"Confirmations: {MIN_CONFIRMATIONS}+ bo‘lsa avtomatik tasdiqlanadi."
+    )
+
+    await call.message.edit_text(txt, reply_markup=order_kb(order_id, is_admin=is_admin(call.from_user.id)), parse_mode="Markdown")
     await call.answer()
 
 
-@dp.callback_query_handler(lambda c: c.data.startswith("check_"))
-async def manual_check(call: types.CallbackQuery):
-    oid = call.data.split("_", 1)[1]
-    order = STATE["pending"].get(str(oid)) or STATE["paid"].get(str(oid))
-    if not order:
-        await call.answer("Заказ топилмади", show_alert=True)
-        return
+# ---------- Order check ----------
+@dp.callback_query(F.data.startswith("order:check:"))
+async def cb_order_check(call: CallbackQuery):
+    order_id = int(call.data.split(":")[2])
+    o = get_order(order_id)
+    if not o or int(o["tg_id"]) != call.from_user.id:
+        return await call.answer("Order topilmadi", show_alert=True)
 
-    if str(oid) in STATE["paid"]:
-        await call.answer("Аллақачон тасдиқланган ✅", show_alert=True)
-        return
+    if o["status"] != "pending":
+        return await call.answer(f"Status: {o['status']}", show_alert=True)
 
-    await call.answer("Текширяпман...")
-    await check_payments_once()
-    # After one check, show status
-    if str(oid) in STATE["paid"]:
-        await call.message.answer(f"✅ Заказ #{oid} тасдиқланди.", reply_markup=main_menu())
+    # Force one check pass (quick)
+    async with aiohttp.ClientSession() as session:
+        ok, txid, conf = await try_match_order_payment(session, o)
+
+    if ok and txid:
+        mark_order_paid(order_id, txid)
+        # credit internal balance
+        add_balance(call.from_user.id, float(o["amount_usd"]))
+
+        await call.message.edit_text(
+            f"✅ Order #{order_id} PAID\n"
+            f"TX: `{txid}`\n"
+            f"Confirmations: {conf}\n\n"
+            f"💰 Balansga qo‘shildi: ${float(o['amount_usd']):.2f}",
+            parse_mode="Markdown",
+            reply_markup=order_kb(order_id, is_admin=is_admin(call.from_user.id))
+        )
+        await call.answer("Paid ✅", show_alert=True)
     else:
-        await call.message.answer("⏳ Ҳали тушмади ёки confirmations кам. Кейинроқ қайта текширинг.", reply_markup=main_menu())
+        await call.answer("Hali to‘lov topilmadi", show_alert=True)
 
 
-@dp.callback_query_handler(lambda c: c.data == "my_orders")
-async def my_orders(call: types.CallbackQuery):
-    text = find_user_orders_text(call.from_user.id)
-    try:
-        await call.message.edit_text(text, reply_markup=back_main_kb())
-    except MessageNotModified:
-        pass
+# =========================
+# ADMIN CALLBACKS / FLOWS
+# =========================
+@dp.callback_query(F.data == "admin:add")
+async def admin_add(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("No", show_alert=True)
+    ADMIN_DRAFTS[call.from_user.id] = AdminDraft(step="name", payload={})
+    await call.message.answer("➕ Product name yubor:")
     await call.answer()
 
+@dp.callback_query(F.data == "admin:list")
+async def admin_list(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("No", show_alert=True)
+    items = list_products(active_only=False)[:50]
+    if not items:
+        await call.message.answer("Tovar yo‘q.")
+    else:
+        lines = ["📦 Products:"]
+        for p in items:
+            lines.append(f"#{p['id']} • {p['name']} • ${float(p['price_usd']):.2f} • stock:{int(p['stock'])} • active:{int(p['is_active'])}")
+        await call.message.answer("\n".join(lines))
+    await call.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "exchange")
-async def exchange(call: types.CallbackQuery):
-    text = (
-        "🔄 Обменники (LTC → USDT / UZS)\n\n"
-        "• Binance P2P\n"
-        "• OKX P2P\n"
-        "• Bybit P2P\n\n"
-        "⚠️ Фақат ишончли P2P сотувчилардан фойдаланинг."
+@dp.callback_query(F.data == "admin:del")
+async def admin_del(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("No", show_alert=True)
+    ADMIN_DRAFTS[call.from_user.id] = AdminDraft(step="del_id", payload={})
+    await call.message.answer("❌ O‘chirish uchun product ID yubor (masalan: 12):")
+    await call.answer()
+
+@dp.callback_query(F.data == "admin:bal")
+async def admin_bal(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("No", show_alert=True)
+    ADMIN_DRAFTS[call.from_user.id] = AdminDraft(step="bal_tg", payload={})
+    await call.message.answer("➕ Balance: user tg_id yubor:")
+    await call.answer()
+
+@dp.callback_query(F.data == "admin:stats")
+async def admin_stats(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("No", show_alert=True)
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) c FROM users")
+        users = cur.fetchone()["c"]
+        cur.execute("SELECT COUNT(*) c FROM orders")
+        orders = cur.fetchone()["c"]
+        cur.execute("SELECT COUNT(*) c FROM orders WHERE status='pending'")
+        pending = cur.fetchone()["c"]
+        cur.execute("SELECT COUNT(*) c FROM orders WHERE status='paid'")
+        paid = cur.fetchone()["c"]
+    await call.message.answer(
+        f"📊 Stats\n"
+        f"Users: {users}\n"
+        f"Orders: {orders}\n"
+        f"Pending: {pending}\n"
+        f"Paid: {paid}\n"
     )
-    try:
-        await call.message.edit_text(text, reply_markup=back_main_kb())
-    except MessageNotModified:
-        pass
     await call.answer()
 
+@dp.callback_query(F.data.startswith("admin:deliver:"))
+async def admin_deliver(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("No", show_alert=True)
+    order_id = int(call.data.split(":")[2])
+    o = get_order(order_id)
+    if not o:
+        return await call.answer("Order topilmadi", show_alert=True)
+    if o["status"] != "paid":
+        return await call.answer(f"Status: {o['status']}", show_alert=True)
+    mark_order_delivered(order_id)
+    await call.message.answer(f"📦 Order #{order_id} delivered ✅")
+    await call.answer("OK")
 
-@dp.callback_query_handler(lambda c: c.data == "contact")
-async def contact(call: types.CallbackQuery):
-    await call.answer()
-    await call.message.answer("☎️ Алоқа:\nАдмин билан боғланиш учун хабар ёзинг.", reply_markup=back_main_kb())
 
+@dp.message()
+async def admin_text_flow(message: Message):
+    tg = message.from_user.id
+    if tg not in ADMIN_DRAFTS:
+        return
 
-@dp.message_handler()
-async def any_text(message: types.Message):
-    # normal chat forward to admin (optional)
-    if isinstance(ADMIN_ID, int) and ADMIN_ID != 0:
+    if not is_admin(tg):
+        ADMIN_DRAFTS.pop(tg, None)
+        return
+
+    draft = ADMIN_DRAFTS[tg]
+
+    if draft.step == "name":
+        draft.payload["name"] = message.text.strip()
+        draft.step = "desc"
+        return await message.answer("Description yubor:")
+
+    if draft.step == "desc":
+        draft.payload["desc"] = message.text.strip()
+        draft.step = "price"
+        return await message.answer("Price USD yubor (masalan: 25.5):")
+
+    if draft.step == "price":
         try:
-            await bot.send_message(ADMIN_ID, f"📩 User {message.from_user.id}:\n{message.text}")
+            price = float(message.text.replace(",", ".").strip())
+            if price <= 0:
+                raise ValueError
         except Exception:
+            return await message.answer("❌ Price noto‘g‘ri. Masalan: 25.5")
+        draft.payload["price"] = price
+        draft.step = "stock"
+        return await message.answer("Stock yubor (masalan: 10):")
+
+    if draft.step == "stock":
+        try:
+            stock = int(message.text.strip())
+            if stock < 0:
+                raise ValueError
+        except Exception:
+            return await message.answer("❌ Stock noto‘g‘ri. Masalan: 10")
+        add_product(
+            name=draft.payload["name"],
+            description=draft.payload["desc"],
+            price_usd=float(draft.payload["price"]),
+            stock=stock
+        )
+        ADMIN_DRAFTS.pop(tg, None)
+        return await message.answer("✅ Product qo‘shildi.")
+
+    if draft.step == "del_id":
+        try:
+            pid = int(message.text.strip())
+        except Exception:
+            return await message.answer("❌ ID noto‘g‘ri.")
+        delete_product(pid)
+        ADMIN_DRAFTS.pop(tg, None)
+        return await message.answer(f"✅ Product #{pid} disabled.")
+
+    if draft.step == "bal_tg":
+        try:
+            target = int(message.text.strip())
+        except Exception:
+            return await message.answer("❌ tg_id noto‘g‘ri.")
+        ensure_user(target)
+        draft.payload["target"] = target
+        draft.step = "bal_amount"
+        return await message.answer("USD miqdor yubor (masalan: 10):")
+
+    if draft.step == "bal_amount":
+        try:
+            usd = float(message.text.replace(",", ".").strip())
+        except Exception:
+            return await message.answer("❌ USD noto‘g‘ri.")
+        target = int(draft.payload["target"])
+        add_balance(target, usd)
+        ADMIN_DRAFTS.pop(tg, None)
+        return await message.answer(f"✅ User {target} balansiga +${usd:.2f} qo‘shildi.")
+
+
+# =========================
+# BACKGROUND PAYMENT CHECKER
+# =========================
+async def try_match_order_payment(session: aiohttp.ClientSession, order_row: sqlite3.Row) -> Tuple[bool, Optional[str], int]:
+    """
+    Returns (matched, txid, confirmations).
+    Checks latest received txs to merchant address and validates:
+    - tx outputs include LTC_ADDRESS with exact amount_ltc
+    - confirmations >= MIN_CONFIRMATIONS
+    - tx not used already
+    """
+    expected = float(order_row["amount_ltc"])
+
+    txs = []
+    try:
+        txs = await fetch_received_txs(session)
+    except Exception:
+        return (False, None, 0)
+
+    # Received list includes txid and value. We'll verify via tx details.
+    for t in txs[:50]:
+        txid = t.get("txid")
+        if not txid:
+            continue
+        if tx_seen(txid):
+            continue
+
+        # Fetch details
+        try:
+            tx_data = await fetch_tx_details(session, txid)
+        except Exception:
+            continue
+        if not tx_data:
+            continue
+
+        conf = get_confirmations(tx_data)
+        if conf < MIN_CONFIRMATIONS:
+            continue
+
+        if tx_pays_exact_amount_to_address(tx_data, LTC_ADDRESS, expected):
+            return (True, txid, conf)
+
+        # mark as seen if it's confirmed but doesn't match any order amount
+        # (optional). We'll not mark here to allow other order matches.
+    return (False, None, 0)
+
+async def payment_watcher():
+    await asyncio.sleep(3)
+    while True:
+        try:
+            pending = get_pending_orders(limit=50)
+            if pending and LTC_ADDRESS:
+                async with aiohttp.ClientSession() as session:
+                    # Iterate pending orders and try to match
+                    for o in pending:
+                        ok, txid, conf = await try_match_order_payment(session, o)
+                        if ok and txid:
+                            # lock tx
+                            mark_tx_seen(txid)
+                            mark_order_paid(int(o["id"]), txid)
+                            add_balance(int(o["tg_id"]), float(o["amount_usd"]))
+
+                            # notify user
+                            try:
+                                await bot.send_message(
+                                    int(o["tg_id"]),
+                                    f"✅ To‘lov tasdiqlandi.\n"
+                                    f"Order #{int(o['id'])}\n"
+                                    f"TX: {txid}\n"
+                                    f"💰 Balansga +${float(o['amount_usd']):.2f}"
+                                )
+                            except Exception:
+                                pass
+        except Exception:
+            # keep loop alive
             pass
-    await message.answer("Менюдан фойдаланинг:", reply_markup=main_menu())
+
+        await asyncio.sleep(CHECK_INTERVAL_SEC)
 
 
-async def on_startup(_dp: Dispatcher):
-    load_state()
-    if not LTC_WALLET:
-        raise RuntimeError("LTC_WALLET env йўқ")
+# =========================
+# MAIN
+# =========================
+async def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN missing")
+    init_db()
 
-    # Start background payments loop
-    asyncio.create_task(payments_loop())
-    logging.info("Started payments loop")
+    # Seed example products (only if empty)
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) c FROM products")
+        if cur.fetchone()["c"] == 0:
+            add_product("GSH MAROCCO 0.5", "Gadget code delivery after payment.", 25.0, 999)
+            add_product("GSH MAROCCO 1", "Gadget code delivery after payment.", 45.0, 999)
 
-
-async def on_shutdown(_dp: Dispatcher):
-    global http
-    save_state()
-    if http and not http.closed:
-        await http.close()
-
+    asyncio.create_task(payment_watcher())
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN env йўқ")
-    executor.start_polling(dp, skip_updates=True, on_startup=on_startup, on_shutdown=on_shutdown)
+    asyncio.run(main())
