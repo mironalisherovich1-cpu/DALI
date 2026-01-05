@@ -1,654 +1,997 @@
 import os
+import re
 import time
-import random
+import uuid
+import math
 import sqlite3
-import asyncio
-from typing import Optional, List, Dict, Tuple
+import random
+import logging
+from datetime import datetime, timezone
 
 import requests
 from aiogram import Bot, Dispatcher, types
+from aiogram.types import (
+    ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    InputFile
+)
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.utils import executor
 
 # =========================
-# ENV
+# CONFIG
 # =========================
+logging.basicConfig(level=logging.INFO)
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-LTC_ADDRESS = os.getenv("LTC_ADDRESS", "").strip()
-ADMIN_IDS = {
-    int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",")
-    if x.isdigit()
-}
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0").strip() or "0")
+LTC_WALLET = os.getenv("LTC_WALLET", "").strip()
 
-DEFAULT_USD_PER_LTC = float(os.getenv("DEFAULT_USD_PER_LTC", "100") or "100")
-MIN_CONFIRMATIONS = int(os.getenv("MIN_CONFIRMATIONS", "1") or "1")
-CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "45") or "45")
+START_IMAGE_URL = os.getenv("START_IMAGE_URL", "").strip()
+SUPPORT_URL = os.getenv("SUPPORT_URL", "https://t.me/LTCEXP").strip()
+OPERATOR_URL = os.getenv("OPERATOR_URL", "https://t.me/LTCEXP").strip()
+CHANNEL_URL = os.getenv("CHANNEL_URL", "").strip()
 
-DB_PATH = os.getenv("DB_PATH", "shop.sqlite3")
+MIN_CONFIRMATIONS = int(os.getenv("MIN_CONFIRMATIONS", "1"))
+DB_PATH = os.getenv("DB_PATH", "bot.db")
 
-# Tolerance: amount match (LTC)
-AMOUNT_TOL_LTC = 0.00000001  # 1 litoshi
+CITIES = ["Buxoro", "Navoiy", "Samarqand", "Toshkent"]
+OBMENNIKI_USERNAME = "LTCEXP"  # @LTCEXP
 
-# APIs
-SOCHAIN_RECEIVED = "https://sochain.com/api/v2/get_tx_received/LTC/{address}"
-SOCHAIN_TX = "https://sochain.com/api/v2/get_tx/LTC/{txid}"
-COINGECKO_RATE = "https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currencies=usd"
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN env yo'q")
+if not LTC_WALLET:
+    raise RuntimeError("LTC_WALLET env yo'q")
+if ADMIN_ID <= 0:
+    logging.warning("ADMIN_ID env yo'q yoki noto'g'ri. Admin panel ishlamaydi.")
 
-bot = Bot(token=BOT_TOKEN, parse_mode=types.ParseMode.MARKDOWN)
-dp = Dispatcher(bot)
-
+bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+dp = Dispatcher(bot, storage=MemoryStorage())
 
 # =========================
-# DB HELPERS
+# DB
 # =========================
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
-
-def ensure_column(conn: sqlite3.Connection, table: str, coldef: str):
-    """coldef example: 'delivery_photo_url TEXT' """
-    colname = coldef.split()[0]
-    cur = conn.cursor()
-    cur.execute(f"PRAGMA table_info({table})")
-    cols = {r[1] for r in cur.fetchall()}
-    if colname not in cols:
-        cur.execute(f"ALTER TABLE {table} ADD COLUMN {coldef}")
-
-
 def init_db():
-    with db() as conn:
-        cur = conn.cursor()
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tg_id INTEGER UNIQUE,
+        city TEXT DEFAULT 'Buxoro',
+        discount REAL DEFAULT 0.0,
+        balance_usd REAL DEFAULT 0.0,
+        balance_ltc REAL DEFAULT 0.0,
+        invited_by INTEGER,
+        created_at TEXT
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS products(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        price_usd REAL,
+        city TEXT,
+        photo_url TEXT,
+        description TEXT,
+        is_active INTEGER DEFAULT 1
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS orders(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_code TEXT UNIQUE,
+        tg_id INTEGER,
+        product_id INTEGER,
+        amount_usd REAL,
+        ltc_amount REAL,
+        ltc_address TEXT,
+        status TEXT DEFAULT 'PENDING',
+        txid TEXT,
+        created_at TEXT,
+        paid_at TEXT
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS reviews(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tg_id INTEGER,
+        product_name TEXT,
+        rating_product INTEGER,
+        rating_service INTEGER,
+        text TEXT,
+        purchased_at TEXT,
+        published_at TEXT
+    )
+    """)
+    conn.commit()
 
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS users(
-            tg_id INTEGER PRIMARY KEY,
-            balance_usd REAL NOT NULL DEFAULT 0,
-            created_at INTEGER NOT NULL
+    # default products (2 ta, keyin admin orqali yana qo'shasan)
+    cur.execute("SELECT COUNT(*) as c FROM products")
+    if cur.fetchone()["c"] == 0:
+        defaults = [
+            ("GSH MAROCCO 0.5", 25.0, "Buxoro", "", "Gadjet. Tez yetkazib berish. (Demo)"),
+            ("GSH MAROCCO 1", 45.0, "Buxoro", "", "Gadjet. Premium variant. (Demo)"),
+        ]
+        cur.executemany(
+            "INSERT INTO products(name, price_usd, city, photo_url, description) VALUES(?,?,?,?,?)",
+            defaults
         )
-        """)
-
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS products(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            description TEXT NOT NULL,
-            price_usd REAL NOT NULL,
-            stock INTEGER NOT NULL DEFAULT 0,
-            is_active INTEGER NOT NULL DEFAULT 1
-        )
-        """)
-
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS orders(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tg_id INTEGER NOT NULL,
-            product_id INTEGER NOT NULL,
-            qty INTEGER NOT NULL,
-            amount_usd REAL NOT NULL,
-            usd_per_ltc REAL NOT NULL,
-            amount_ltc REAL NOT NULL,
-            status TEXT NOT NULL,
-            created_at INTEGER NOT NULL,
-            paid_at INTEGER,
-            txid TEXT
-        )
-        """)
-
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS seen_tx(
-            txid TEXT PRIMARY KEY,
-            seen_at INTEGER NOT NULL
-        )
-        """)
-
         conn.commit()
+    conn.close()
 
-        # MIGRATIONS (delivery)
-        ensure_column(conn, "products", "delivery_photo_url TEXT")
-        ensure_column(conn, "products", "delivery_caption TEXT")
+def get_user(tg_id: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE tg_id=?", (tg_id,))
+    row = cur.fetchone()
+    if not row:
+        cur.execute(
+            "INSERT INTO users(tg_id, city, discount, balance_usd, balance_ltc, created_at) VALUES(?,?,?,?,?,?)",
+            (tg_id, CITIES[0], 0.0, 0.0, 0.0, datetime.now(timezone.utc).isoformat())
+        )
         conn.commit()
-
-
-def ensure_user(tg_id: int):
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT tg_id FROM users WHERE tg_id=?", (tg_id,))
-        if cur.fetchone() is None:
-            cur.execute(
-                "INSERT INTO users(tg_id, balance_usd, created_at) VALUES(?,?,?)",
-                (tg_id, 0.0, int(time.time()))
-            )
-            conn.commit()
-
-
-def get_balance(tg_id: int) -> float:
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT balance_usd FROM users WHERE tg_id=?", (tg_id,))
+        cur.execute("SELECT * FROM users WHERE tg_id=?", (tg_id,))
         row = cur.fetchone()
-        return float(row["balance_usd"]) if row else 0.0
+    conn.close()
+    return row
 
+def set_user_city(tg_id: int, city: str):
+    conn = db()
+    conn.execute("UPDATE users SET city=? WHERE tg_id=?", (city, tg_id))
+    conn.commit()
+    conn.close()
 
-def add_balance(tg_id: int, usd: float):
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("UPDATE users SET balance_usd = balance_usd + ? WHERE tg_id=?", (usd, tg_id))
-        conn.commit()
-
-
-def add_product(name: str, description: str, price_usd: float, stock: int):
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO products(name, description, price_usd, stock, is_active) VALUES(?,?,?,?,1)",
-            (name, description, price_usd, stock)
-        )
-        conn.commit()
-
-
-def set_delivery(pid: int, photo_url: str, caption: str):
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "UPDATE products SET delivery_photo_url=?, delivery_caption=? WHERE id=?",
-            (photo_url, caption, pid)
-        )
-        conn.commit()
-
-
-def disable_product(pid: int):
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("UPDATE products SET is_active=0 WHERE id=?", (pid,))
-        conn.commit()
-
-
-def list_products(active_only=True) -> List[sqlite3.Row]:
-    with db() as conn:
-        cur = conn.cursor()
-        if active_only:
-            cur.execute("SELECT * FROM products WHERE is_active=1 ORDER BY id DESC")
-        else:
-            cur.execute("SELECT * FROM products ORDER BY id DESC")
-        return cur.fetchall()
-
-
-def get_product(pid: int) -> Optional[sqlite3.Row]:
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM products WHERE id=?", (pid,))
-        return cur.fetchone()
-
-
-def create_order(tg_id: int, pid: int, qty: int, amount_usd: float, usd_per_ltc: float, amount_ltc: float) -> int:
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO orders(tg_id, product_id, qty, amount_usd, usd_per_ltc, amount_ltc, status, created_at)
-            VALUES(?,?,?,?,?,?, 'pending', ?)
-        """, (tg_id, pid, qty, amount_usd, usd_per_ltc, amount_ltc, int(time.time())))
-        conn.commit()
-        return int(cur.lastrowid)
-
-
-def get_order(order_id: int) -> Optional[sqlite3.Row]:
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT o.*, p.name as product_name, p.description as product_desc,
-                   p.delivery_photo_url as delivery_photo_url, p.delivery_caption as delivery_caption
-            FROM orders o JOIN products p ON p.id=o.product_id
-            WHERE o.id=?
-        """, (order_id,))
-        return cur.fetchone()
-
-
-def user_orders(tg_id: int, limit: int = 15) -> List[sqlite3.Row]:
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT o.*, p.name as product_name
-            FROM orders o JOIN products p ON p.id=o.product_id
-            WHERE o.tg_id=?
-            ORDER BY o.id DESC
-            LIMIT ?
-        """, (tg_id, limit))
-        return cur.fetchall()
-
-
-def pending_orders(limit=50) -> List[sqlite3.Row]:
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM orders WHERE status='pending' ORDER BY created_at ASC LIMIT ?", (limit,))
-        return cur.fetchall()
-
-
-def mark_order_paid(order_id: int, txid: str):
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "UPDATE orders SET status='paid', paid_at=?, txid=? WHERE id=? AND status='pending'",
-            (int(time.time()), txid, order_id)
-        )
-        conn.commit()
-
-
-def tx_seen(txid: str) -> bool:
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT txid FROM seen_tx WHERE txid=?", (txid,))
-        return cur.fetchone() is not None
-
-
-def mark_tx_seen(txid: str):
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("INSERT OR IGNORE INTO seen_tx(txid, seen_at) VALUES(?,?)", (txid, int(time.time())))
-        conn.commit()
-
-
-def is_admin(tg_id: int) -> bool:
-    return tg_id in ADMIN_IDS
-
+def set_user_discount(tg_id: int, discount: float):
+    conn = db()
+    conn.execute("UPDATE users SET discount=? WHERE tg_id=?", (discount, tg_id))
+    conn.commit()
+    conn.close()
 
 # =========================
-# UI
+# PRICE (LTC/USD)
 # =========================
-def main_menu():
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add("🛒 Shop", "💰 Balance")
-    kb.add("📦 My Orders", "ℹ️ Info")
+_price_cache = {"ts": 0, "price": None}
+
+def get_ltc_usd_price() -> float:
+    # cache 60s
+    now = time.time()
+    if _price_cache["price"] and now - _price_cache["ts"] < 60:
+        return _price_cache["price"]
+
+    # CoinGecko
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    try:
+        r = requests.get(url, params={"ids": "litecoin", "vs_currencies": "usd"}, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        price = float(data["litecoin"]["usd"])
+        _price_cache.update({"ts": now, "price": price})
+        return price
+    except Exception as e:
+        # fallback (so‘nggi cache bo‘lsa o‘shani qaytar)
+        if _price_cache["price"]:
+            return _price_cache["price"]
+        raise RuntimeError(f"LTC narxini olishda xatolik: {e}")
+
+def usd_to_ltc(usd: float) -> float:
+    p = get_ltc_usd_price()
+    return usd / p
+
+# =========================
+# PAYMENT CHECK (address tx)
+# =========================
+def to_satoshi(ltc_amount: float) -> int:
+    return int(round(ltc_amount * 100_000_000))
+
+def satoshi_to_ltc(sat: int) -> float:
+    return sat / 100_000_000.0
+
+def fetch_txrefs_blockcypher(address: str):
+    # Returns list of {tx_hash, value_satoshi, confirmations}
+    # https://api.blockcypher.com/v1/ltc/main/addrs/<address>?limit=50
+    url = f"https://api.blockcypher.com/v1/ltc/main/addrs/{address}"
+    r = requests.get(url, params={"limit": 50}, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    txrefs = data.get("txrefs", []) or []
+    res = []
+    for t in txrefs:
+        if t.get("tx_input_n", -1) != -1:
+            continue  # incoming only (tx_input_n == -1 is output to us)
+        res.append({
+            "tx_hash": t.get("tx_hash"),
+            "value": int(t.get("value", 0)),
+            "confirmations": int(t.get("confirmations", 0)),
+        })
+    return res
+
+def try_find_payment(expected_satoshi: int, tolerance_satoshi: int = 20):
+    """
+    Search incoming txrefs to LTC_WALLET and match by received satoshi.
+    tolerance_satoshi allows tiny rounding differences.
+    """
+    try:
+        txrefs = fetch_txrefs_blockcypher(LTC_WALLET)
+    except Exception:
+        return None
+
+    for t in txrefs:
+        if t["confirmations"] < MIN_CONFIRMATIONS:
+            continue
+        if abs(t["value"] - expected_satoshi) <= tolerance_satoshi:
+            return t["tx_hash"]
+    return None
+
+# =========================
+# UI (reply keyboards)
+# =========================
+def main_menu_kb(is_admin: bool = False):
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(KeyboardButton("👤 Profilim"))
+    kb.row(KeyboardButton("🛍 Vitrina"), KeyboardButton("💱 Obmenniki"))
+    kb.row(KeyboardButton("⭐ Izohlar"), KeyboardButton("🆘 Yordam"))
+    kb.row(KeyboardButton("💬 Kanal"), KeyboardButton("🤖 Shaxsiy bot"))
+    kb.row(KeyboardButton("💼 Ish"))
+    if is_admin:
+        kb.row(KeyboardButton("🛠 Admin panel"))
     return kb
 
-
-def products_kb():
-    rows = []
-    for p in list_products(True)[:50]:
-        rows.append([types.InlineKeyboardButton(
-            text=f"#{p['id']} • {p['name']} • ${float(p['price_usd']):.2f}",
-            callback_data=f"p:{p['id']}"
-        )])
-    rows.append([types.InlineKeyboardButton("🔄 Refresh", callback_data="shop:refresh")])
-    return types.InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def product_kb(pid: int):
-    return types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton("✅ Buy 1", callback_data=f"buy:{pid}:1")],
-        [types.InlineKeyboardButton("⬅️ Back", callback_data="shop:back")]
-    ])
-
-
-def order_kb(order_id: int):
-    return types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton("🔄 Check payment", callback_data=f"order:check:{order_id}")],
-        [types.InlineKeyboardButton("⬅️ Back to Shop", callback_data="shop:back")]
-    ])
-
+def back_to_menu_kb(is_admin: bool = False):
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(KeyboardButton("🏠 Asosiy menyu"))
+    if is_admin:
+        kb.row(KeyboardButton("🛠 Admin panel"))
+    return kb
 
 # =========================
-# PAYMENT
+# STATES (admin add product)
 # =========================
-async def http_get_json(url: str, timeout=15) -> Dict:
-    def _get():
-        return requests.get(url, timeout=timeout).json()
-    return await asyncio.to_thread(_get)
+class AddProduct(StatesGroup):
+    name = State()
+    price = State()
+    city = State()
+    photo = State()
+    desc = State()
 
+# =========================
+# HELPERS
+# =========================
+def is_admin(user_id: int) -> bool:
+    return ADMIN_ID > 0 and user_id == ADMIN_ID
 
-async def usd_per_ltc() -> float:
-    try:
-        j = await http_get_json(COINGECKO_RATE, timeout=10)
-        v = float(j["litecoin"]["usd"])
-        return v if v > 0 else DEFAULT_USD_PER_LTC
-    except Exception:
-        return DEFAULT_USD_PER_LTC
+def fmt_money(x: float) -> str:
+    return f"{x:.2f}"
 
+def fmt_ltc(x: float) -> str:
+    # show up to 8 decimals
+    return f"{x:.8f}".rstrip("0").rstrip(".")
 
-def make_unique_amount(base: float) -> float:
-    # base LTC => unique by adding 1..50 litoshis
-    litoshis = int(round(base * 1e8))
-    offset = random.randint(1, 50)
-    return (litoshis + offset) / 1e8
+def gen_order_code() -> str:
+    return f"DALI-{random.randint(100000, 999999)}"
 
+# =========================
+# START / MENU
+# =========================
+@dp.message_handler(commands=["start"])
+async def start(message: types.Message):
+    user = get_user(message.from_user.id)
 
-def confirmations(tx_data: Dict) -> int:
-    try:
-        return int(tx_data.get("confirmations", 0))
-    except Exception:
-        return 0
+    # referral parse: /start ref_<id>
+    if message.get_args():
+        m = re.match(r"ref_(\d+)", message.get_args().strip())
+        if m:
+            inviter = int(m.group(1))
+            # simple referral: if first time invited_by is null -> set + 5% discount
+            conn = db()
+            cur = conn.cursor()
+            cur.execute("SELECT invited_by FROM users WHERE tg_id=?", (message.from_user.id,))
+            inv = cur.fetchone()
+            if inv and inv["invited_by"] is None and inviter != message.from_user.id:
+                cur.execute("UPDATE users SET invited_by=?, discount=? WHERE tg_id=?",
+                            (inviter, 5.0, message.from_user.id))
+                conn.commit()
+            conn.close()
 
-
-def tx_pays_exact_amount(tx_data: Dict, address: str, expected_ltc: float) -> bool:
-    outs = tx_data.get("outputs", [])
-    for o in outs:
-        if o.get("address") == address:
-            try:
-                v = float(o.get("value"))
-            except Exception:
-                continue
-            if abs(v - expected_ltc) <= AMOUNT_TOL_LTC:
-                return True
-    return False
-
-
-async def try_match_order(o: sqlite3.Row) -> Tuple[bool, Optional[str], int]:
-    expected = float(o["amount_ltc"])
-    try:
-        received = await http_get_json(SOCHAIN_RECEIVED.format(address=LTC_ADDRESS), timeout=15)
-        if received.get("status") != "success":
-            return (False, None, 0)
-        txs = received["data"].get("txs", [])
-    except Exception:
-        return (False, None, 0)
-
-    for t in txs[:80]:
-        txid = t.get("txid")
-        if not txid or tx_seen(txid):
-            continue
-
+    text = (
+        "🚗 <b>DALI SHOP</b>\n\n"
+        "✅ Keng tanlov (qonuniy gadjetlar/aksessuarlar)\n"
+        "🔄 Oson xarid jarayoni\n"
+        "🛡 Sifat kafolati\n\n"
+        "<b>Asosiy menyu:</b>"
+    )
+    kb = main_menu_kb(is_admin=is_admin(message.from_user.id))
+    if START_IMAGE_URL:
         try:
-            txj = await http_get_json(SOCHAIN_TX.format(txid=txid), timeout=15)
-            if txj.get("status") != "success":
-                continue
-            tx_data = txj.get("data") or {}
+            await message.answer_photo(START_IMAGE_URL, caption=text, reply_markup=kb)
+            return
         except Exception:
-            continue
+            pass
+    await message.answer(text, reply_markup=kb)
 
-        conf = confirmations(tx_data)
-        if conf < MIN_CONFIRMATIONS:
-            continue
+@dp.message_handler(lambda m: m.text in ["🏠 Asosiy menyu", "Главное меню", "Главное меню:"])
+async def go_menu(message: types.Message):
+    kb = main_menu_kb(is_admin=is_admin(message.from_user.id))
+    await message.answer("🏠 Asosiy menyu:", reply_markup=kb)
 
-        if tx_pays_exact_amount(tx_data, LTC_ADDRESS, expected):
-            return (True, txid, conf)
+# =========================
+# PROFILE
+# =========================
+@dp.message_handler(lambda m: m.text == "👤 Profilim")
+async def profile(message: types.Message):
+    user = get_user(message.from_user.id)
 
-    return (False, None, 0)
+    # show balance (internal) + show city + discount
+    ref_link = f"https://t.me/{(await bot.get_me()).username}?start=ref_{message.from_user.id}"
+    text = (
+        f"🪪 <b>Profil</b>\n"
+        f"🆔 ID: <code>{message.from_user.id}</code>\n"
+        f"🏙 Tanlangan shahar: <b>{user['city']}</b>\n\n"
+        f"🎟 Shaxsiy chegirma: <b>{fmt_money(user['discount'])}%</b>\n"
+        f"💰 Balans: <b>${fmt_money(user['balance_usd'])}</b> | <b>{fmt_ltc(user['balance_ltc'])} LTC</b>\n\n"
+        f"🔗 Taklif havolasi:\n{ref_link}"
+    )
 
+    ikb = InlineKeyboardMarkup(row_width=1)
+    ikb.add(
+        InlineKeyboardButton("✍️ Promokod aktivatsiya", callback_data="promo"),
+        InlineKeyboardButton("🛍 Xaridlar tarixi", callback_data="history"),
+        InlineKeyboardButton("🔄 Shaharni o'zgartirish", callback_data="city_change"),
+        InlineKeyboardButton("⬅️ Asosiy menyu", callback_data="back_menu"),
+    )
+    await message.answer(text, reply_markup=ikb)
 
-async def send_delivery(tg_id: int, order_id: int):
-    """Send delivery photo to buyer after payment."""
-    o = get_order(order_id)
-    if not o:
+@dp.callback_query_handler(lambda c: c.data == "back_menu")
+async def cb_back_menu(call: types.CallbackQuery):
+    await call.message.delete()
+    kb = main_menu_kb(is_admin=is_admin(call.from_user.id))
+    await bot.send_message(call.from_user.id, "🏠 Asosiy menyu:", reply_markup=kb)
+
+@dp.callback_query_handler(lambda c: c.data == "city_change")
+async def cb_city_change(call: types.CallbackQuery):
+    ikb = InlineKeyboardMarkup(row_width=2)
+    for c in CITIES:
+        ikb.insert(InlineKeyboardButton(c, callback_data=f"city_set:{c}"))
+    ikb.add(InlineKeyboardButton("⬅️ Orqaga", callback_data="profile_back"))
+    await call.message.edit_text("🏙 Shaharni tanlang:", reply_markup=ikb)
+
+@dp.callback_query_handler(lambda c: c.data.startswith("city_set:"))
+async def cb_city_set(call: types.CallbackQuery):
+    city = call.data.split(":", 1)[1]
+    if city not in CITIES:
+        await call.answer("Noto'g'ri shahar", show_alert=True)
         return
-    url = (o["delivery_photo_url"] or "").strip()
-    caption = (o["delivery_caption"] or "").strip()
+    set_user_city(call.from_user.id, city)
+    await call.answer("Saqlandi ✅")
+    await call.message.edit_text(f"✅ Shahar o'zgardi: <b>{city}</b>", reply_markup=InlineKeyboardMarkup().add(
+        InlineKeyboardButton("⬅️ Profilga qaytish", callback_data="profile_back")
+    ))
 
-    if not url:
-        # fallback if admin forgot set delivery
-        await bot.send_message(tg_id, f"✅ To‘lov tasdiqlandi. Order #{order_id}\n❗ Delivery rasm sozlanmagan.")
+@dp.callback_query_handler(lambda c: c.data == "profile_back")
+async def cb_profile_back(call: types.CallbackQuery):
+    # re-render profile
+    fake = types.Message(
+        message_id=call.message.message_id,
+        date=call.message.date,
+        chat=call.message.chat,
+        from_user=call.from_user,
+        sender_chat=None,
+        content_type="text",
+        options={}
+    )
+    await bot.delete_message(call.message.chat.id, call.message.message_id)
+    await profile(fake)
+
+# Promo (simple)
+@dp.callback_query_handler(lambda c: c.data == "promo")
+async def cb_promo(call: types.CallbackQuery):
+    await call.message.edit_text(
+        "✍️ Promokod kiriting (masalan: <code>DALI5</code>)\n\n"
+        "Bekor qilish: /menu",
+        reply_markup=None
+    )
+    state = dp.current_state(user=call.from_user.id)
+    await state.set_state("await_promo")
+
+@dp.message_handler(state="await_promo")
+async def promo_enter(message: types.Message, state: FSMContext):
+    code = (message.text or "").strip().upper()
+    if code == "DALI5":
+        set_user_discount(message.from_user.id, 5.0)
+        await message.answer("✅ Promokod qabul qilindi. Chegirma: <b>5%</b>", reply_markup=back_to_menu_kb(is_admin=is_admin(message.from_user.id)))
+    else:
+        await message.answer("❌ Promokod noto'g'ri.", reply_markup=back_to_menu_kb(is_admin=is_admin(message.from_user.id)))
+    await state.finish()
+
+# History
+@dp.callback_query_handler(lambda c: c.data == "history")
+async def cb_history(call: types.CallbackQuery):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT o.order_code, o.status, o.amount_usd, o.ltc_amount, p.name
+        FROM orders o
+        LEFT JOIN products p ON p.id=o.product_id
+        WHERE o.tg_id=?
+        ORDER BY o.id DESC
+        LIMIT 10
+    """, (call.from_user.id,))
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        await call.message.edit_text("🛍 Xaridlar tarixi bo'sh.", reply_markup=InlineKeyboardMarkup().add(
+            InlineKeyboardButton("⬅️ Orqaga", callback_data="profile_back")
+        ))
         return
 
-    text = caption if caption else "✅ Xarid uchun rahmat."
-    text = f"{text}\n\nOrder: #{order_id}\nTX: `{o['txid']}`" if o["txid"] else f"{text}\n\nOrder: #{order_id}"
-    await bot.send_photo(tg_id, photo=url, caption=text)
+    lines = ["🛍 <b>So‘nggi 10 ta xarid</b>\n"]
+    for r in rows:
+        lines.append(
+            f"• <b>{r['name'] or 'Mahsulot'}</b>\n"
+            f"  ID: <code>{r['order_code']}</code>\n"
+            f"  Status: <b>{r['status']}</b>\n"
+            f"  Summa: <b>${fmt_money(r['amount_usd'])}</b> | <b>{fmt_ltc(r['ltc_amount'])} LTC</b>\n"
+        )
+    await call.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup().add(
+        InlineKeyboardButton("⬅️ Orqaga", callback_data="profile_back")
+    ))
 
+# =========================
+# OBMENNIKI
+# =========================
+@dp.message_handler(lambda m: m.text == "💱 Obmenniki")
+async def obmenniki(message: types.Message):
+    text = "💱 <b>Ishonchli obmenniklar ro'yxati:</b>"
+    ikb = InlineKeyboardMarkup(row_width=1)
+    ikb.add(
+        InlineKeyboardButton("↗️ LTCEXP", url=f"https://t.me/{OBMENNIKI_USERNAME}")
+    )
+    await message.answer(text, reply_markup=ikb)
 
-async def payment_watcher():
-    await asyncio.sleep(3)
-    while True:
+# =========================
+# CHANNEL / PERSONAL BOT / JOB (placeholders)
+# =========================
+@dp.message_handler(lambda m: m.text == "💬 Kanal")
+async def channel(message: types.Message):
+    if CHANNEL_URL:
+        await message.answer("💬 Kanal:", reply_markup=InlineKeyboardMarkup().add(
+            InlineKeyboardButton("↗️ Kanalga o'tish", url=CHANNEL_URL)
+        ))
+    else:
+        await message.answer("💬 Kanal hali ulanmagan.", reply_markup=back_to_menu_kb(is_admin=is_admin(message.from_user.id)))
+
+@dp.message_handler(lambda m: m.text == "🤖 Shaxsiy bot")
+async def personal_bot(message: types.Message):
+    await message.answer("🤖 Shaxsiy bot: tez orada.", reply_markup=back_to_menu_kb(is_admin=is_admin(message.from_user.id)))
+
+@dp.message_handler(lambda m: m.text == "💼 Ish")
+async def job(message: types.Message):
+    await message.answer("💼 Ish: tez orada.", reply_markup=back_to_menu_kb(is_admin=is_admin(message.from_user.id)))
+
+# =========================
+# HELP
+# =========================
+@dp.message_handler(lambda m: m.text == "🆘 Yordam")
+async def help_menu(message: types.Message):
+    text = (
+        "🆘 <b>Yordam</b>\n\n"
+        "Qoidalar matnini kiriting yoki telegram post havolasini qo'shing.\n"
+        "(Bu bo‘limni keyin kengaytiramiz.)"
+    )
+    ikb = InlineKeyboardMarkup(row_width=1)
+    ikb.add(
+        InlineKeyboardButton("↗️ Support", url=SUPPORT_URL),
+        InlineKeyboardButton("↗️ Operator", url=OPERATOR_URL),
+    )
+    await message.answer(text, reply_markup=ikb)
+
+# =========================
+# REVIEWS (pagination)
+# =========================
+def render_review_page(page: int, per_page: int = 1):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) AS c FROM reviews")
+    total = cur.fetchone()["c"]
+    if total == 0:
+        conn.close()
+        return None, 0
+
+    pages = max(1, math.ceil(total / per_page))
+    page = max(1, min(page, pages))
+    offset = (page - 1) * per_page
+
+    cur.execute("""
+        SELECT * FROM reviews ORDER BY id DESC LIMIT ? OFFSET ?
+    """, (per_page, offset))
+    row = cur.fetchone()
+    conn.close()
+
+    text = (
+        f"📝 <b>Izoh #{row['id']}:</b>\n\n"
+        f"• Mahsulot: <b>{row['product_name']}</b>\n"
+        f"• Mahsulot bahosi: {'⭐' * int(row['rating_product'])}\n"
+        f"• Xizmat bahosi: {'⭐' * int(row['rating_service'])}\n\n"
+        f"• {row['text']}\n\n"
+        f"• Xarid sanasi: {row['purchased_at']}\n"
+        f"• E'lon qilingan: {row['published_at']}\n"
+    )
+    return (text, pages)
+
+@dp.message_handler(lambda m: m.text == "⭐ Izohlar")
+async def reviews(message: types.Message):
+    text, pages = render_review_page(1)
+    if not text:
+        await message.answer("⭐ Izohlar hozircha yo'q.", reply_markup=back_to_menu_kb(is_admin=is_admin(message.from_user.id)))
+        return
+
+    ikb = InlineKeyboardMarkup(row_width=3)
+    ikb.row(
+        InlineKeyboardButton("◀️", callback_data="rev:prev:1"),
+        InlineKeyboardButton(f"1/{pages}", callback_data="rev:noop"),
+        InlineKeyboardButton("▶️", callback_data="rev:next:1"),
+    )
+    ikb.add(InlineKeyboardButton("⬅️ Asosiy menyu", callback_data="back_menu"))
+    await message.answer(text, reply_markup=ikb)
+
+@dp.callback_query_handler(lambda c: c.data.startswith("rev:"))
+async def cb_reviews(call: types.CallbackQuery):
+    parts = call.data.split(":")
+    action = parts[1]
+    current = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
+
+    text, pages = render_review_page(current)
+    if not text:
+        await call.answer("Izoh yo'q", show_alert=True)
+        return
+
+    if action == "prev":
+        new_page = max(1, current - 1)
+    elif action == "next":
+        new_page = current + 1
+    else:
+        await call.answer()
+        return
+
+    text, pages = render_review_page(new_page)
+    ikb = InlineKeyboardMarkup(row_width=3)
+    ikb.row(
+        InlineKeyboardButton("◀️", callback_data=f"rev:prev:{new_page}"),
+        InlineKeyboardButton(f"{new_page}/{pages}", callback_data="rev:noop"),
+        InlineKeyboardButton("▶️", callback_data=f"rev:next:{new_page}"),
+    )
+    ikb.add(InlineKeyboardButton("⬅️ Asosiy menyu", callback_data="back_menu"))
+    await call.message.edit_text(text, reply_markup=ikb)
+    await call.answer()
+
+# =========================
+# SHOWCASE (VITRINA)
+# =========================
+@dp.message_handler(lambda m: m.text == "🛍 Vitrina")
+async def showcase(message: types.Message):
+    user = get_user(message.from_user.id)
+    city = user["city"]
+
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT * FROM products
+        WHERE is_active=1 AND (city=? OR city='ALL')
+        ORDER BY id ASC
+    """, (city,))
+    items = cur.fetchall()
+    conn.close()
+
+    header = (
+        f"🛒 <b>Shahardagi aktual tovarlar:</b> <b>{city}</b>\n\n"
+        f"ℹ️ Boshqa shahar tovarlarini ko‘rish uchun profil bo‘limida shaharni o‘zgartiring."
+    )
+
+    if not items:
+        await message.answer(header + "\n\n❌ Hozircha tovar yo'q.", reply_markup=back_to_menu_kb(is_admin=is_admin(message.from_user.id)))
+        return
+
+    ikb = InlineKeyboardMarkup(row_width=1)
+    for p in items:
+        ikb.add(InlineKeyboardButton(f"{p['name']} — ${fmt_money(p['price_usd'])}", callback_data=f"prod:{p['id']}"))
+    ikb.add(InlineKeyboardButton("⬅️ Asosiy menyu", callback_data="back_menu"))
+
+    await message.answer(header, reply_markup=ikb)
+
+@dp.callback_query_handler(lambda c: c.data.startswith("prod:"))
+async def cb_product(call: types.CallbackQuery):
+    pid = int(call.data.split(":")[1])
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM products WHERE id=?", (pid,))
+    p = cur.fetchone()
+    conn.close()
+
+    if not p or p["is_active"] != 1:
+        await call.answer("Mahsulot topilmadi", show_alert=True)
+        return
+
+    user = get_user(call.from_user.id)
+    disc = float(user["discount"] or 0.0)
+    price = float(p["price_usd"])
+    final_price = price * (1.0 - disc / 100.0)
+
+    text = (
+        f"🛍 <b>{p['name']}</b>\n\n"
+        f"📝 {p['description'] or '—'}\n\n"
+        f"🏙 Shahar: <b>{p['city']}</b>\n"
+        f"💵 Narx: <b>${fmt_money(price)}</b>\n"
+        f"🎟 Chegirma: <b>{fmt_money(disc)}%</b>\n"
+        f"✅ Yakuniy narx: <b>${fmt_money(final_price)}</b>\n"
+    )
+
+    ikb = InlineKeyboardMarkup(row_width=1)
+    ikb.add(
+        InlineKeyboardButton("💳 Sotib olish (LTC)", callback_data=f"buy:{pid}"),
+        InlineKeyboardButton("⬅️ Vitrinaga qaytish", callback_data="back_showcase")
+    )
+
+    # product photo if any
+    if p["photo_url"]:
         try:
-            if LTC_ADDRESS:
-                for o in pending_orders(50):
-                    ok, txid, conf = await try_match_order(o)
-                    if ok and txid:
-                        mark_tx_seen(txid)
-                        mark_order_paid(int(o["id"]), txid)
-                        add_balance(int(o["tg_id"]), float(o["amount_usd"]))
+            await call.message.edit_caption(caption=text, reply_markup=ikb)
+        except Exception:
+            try:
+                await call.message.delete()
+            except Exception:
+                pass
+            await bot.send_photo(call.from_user.id, p["photo_url"], caption=text, reply_markup=ikb)
+    else:
+        await call.message.edit_text(text, reply_markup=ikb)
 
-                        # attach txid into order row for delivery message
-                        # (re-read order after mark paid)
-                        await send_delivery(int(o["tg_id"]), int(o["id"]))
+    await call.answer()
 
+@dp.callback_query_handler(lambda c: c.data == "back_showcase")
+async def cb_back_showcase(call: types.CallbackQuery):
+    await call.message.delete()
+    fake = types.Message(
+        message_id=call.message.message_id,
+        date=call.message.date,
+        chat=call.message.chat,
+        from_user=call.from_user,
+        sender_chat=None,
+        content_type="text",
+        options={}
+    )
+    await showcase(fake)
+
+# =========================
+# BUY / PAY / DELIVER
+# =========================
+@dp.callback_query_handler(lambda c: c.data.startswith("buy:"))
+async def cb_buy(call: types.CallbackQuery):
+    pid = int(call.data.split(":")[1])
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM products WHERE id=?", (pid,))
+    p = cur.fetchone()
+    conn.close()
+    if not p or p["is_active"] != 1:
+        await call.answer("Mahsulot topilmadi", show_alert=True)
+        return
+
+    user = get_user(call.from_user.id)
+    disc = float(user["discount"] or 0.0)
+    price = float(p["price_usd"])
+    final_usd = price * (1.0 - disc / 100.0)
+
+    # compute LTC amount + tiny uniqueness tag
+    ltc = usd_to_ltc(final_usd)
+    # add uniqueness tag (1..80 satoshis)
+    tag_sat = random.randint(1, 80)
+    ltc_sat = to_satoshi(ltc) + tag_sat
+    ltc_final = satoshi_to_ltc(ltc_sat)
+
+    order_code = gen_order_code()
+    created_at = datetime.now(timezone.utc).isoformat()
+
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO orders(order_code, tg_id, product_id, amount_usd, ltc_amount, ltc_address, status, created_at)
+        VALUES(?,?,?,?,?,?, 'PENDING', ?)
+    """, (order_code, call.from_user.id, pid, float(final_usd), float(ltc_final), LTC_WALLET, created_at))
+    conn.commit()
+    conn.close()
+
+    text = (
+        f"💳 <b>To‘lov</b>\n\n"
+        f"🛍 Mahsulot: <b>{p['name']}</b>\n"
+        f"🧾 Buyurtma: <code>{order_code}</code>\n\n"
+        f"✅ To‘lash kerak: <b>{fmt_ltc(ltc_final)} LTC</b>\n"
+        f"🏦 Manzil (LTC):\n<code>{LTC_WALLET}</code>\n\n"
+        f"ℹ️ Eslatma: bot to‘lovni avtomatik tekshiradi.\n"
+        f"⏳ Tasdiq: <b>{MIN_CONFIRMATIONS} conf</b>\n"
+    )
+
+    ikb = InlineKeyboardMarkup(row_width=1)
+    ikb.add(
+        InlineKeyboardButton("🔄 To‘lovni tekshirish", callback_data=f"check:{order_code}"),
+        InlineKeyboardButton("⬅️ Asosiy menyu", callback_data="back_menu")
+    )
+
+    await call.message.edit_text(text, reply_markup=ikb)
+    await call.answer()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("check:"))
+async def cb_check(call: types.CallbackQuery):
+    order_code = call.data.split(":", 1)[1]
+
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT o.*, p.name as product_name, p.photo_url as photo_url
+        FROM orders o
+        LEFT JOIN products p ON p.id=o.product_id
+        WHERE o.order_code=? AND o.tg_id=?
+    """, (order_code, call.from_user.id))
+    o = cur.fetchone()
+    conn.close()
+
+    if not o:
+        await call.answer("Buyurtma topilmadi", show_alert=True)
+        return
+
+    if o["status"] == "PAID":
+        await call.answer("Allaqachon to'langan ✅", show_alert=True)
+        return
+
+    expected_sat = to_satoshi(float(o["ltc_amount"]))
+    txid = try_find_payment(expected_sat)
+
+    if not txid:
+        await call.answer("Hali to‘lov topilmadi. Keyinroq qayta urinib ko‘ring.", show_alert=True)
+        return
+
+    # mark paid
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("UPDATE orders SET status='PAID', txid=?, paid_at=? WHERE order_code=?",
+                (txid, datetime.now(timezone.utc).isoformat(), order_code))
+    conn.commit()
+    conn.close()
+
+    # deliver: send photo (if available) + caption info
+    deliver_caption = (
+        f"✅ <b>To‘lov qabul qilindi!</b>\n\n"
+        f"🧾 Buyurtma: <code>{order_code}</code>\n"
+        f"🛍 Mahsulot: <b>{o['product_name']}</b>\n"
+        f"💳 To‘langan: <b>{fmt_ltc(float(o['ltc_amount']))} LTC</b>\n"
+        f"🔗 TXID: <code>{txid}</code>\n\n"
+        f"📦 Yetkazib berish / instruktsiya:\n"
+        f"— (bu yerga mahsulot bo‘yicha kerakli info yoziladi)\n"
+    )
+
+    try:
+        if o["photo_url"]:
+            await bot.send_photo(call.from_user.id, o["photo_url"], caption=deliver_caption)
+        else:
+            await bot.send_message(call.from_user.id, deliver_caption)
+    except Exception:
+        await bot.send_message(call.from_user.id, deliver_caption)
+
+    # notify admin
+    if ADMIN_ID > 0:
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"✅ <b>Yangi to‘lov</b>\n"
+                f"Buyurtma: <code>{order_code}</code>\n"
+                f"User: <code>{call.from_user.id}</code>\n"
+                f"Mahsulot: <b>{o['product_name']}</b>\n"
+                f"LTC: <b>{fmt_ltc(float(o['ltc_amount']))}</b>\n"
+                f"TXID: <code>{txid}</code>"
+            )
         except Exception:
             pass
 
-        await asyncio.sleep(CHECK_INTERVAL_SEC)
-
-
-# =========================
-# HANDLERS
-# =========================
-@dp.message_handler(commands=["start"])
-async def start(m: types.Message):
-    ensure_user(m.from_user.id)
-    await m.answer("✅ Bot ishga tushdi.", reply_markup=main_menu())
-
-
-@dp.message_handler(commands=["admin"])
-async def admin(m: types.Message):
-    if not is_admin(m.from_user.id):
-        return await m.answer("❌ Admin emas.")
-    await m.answer(
-        "🧑‍💼 *Admin panel*\n\n"
-        "1) Product qo‘shish:\n"
-        "`/add_product Name | PriceUSD | Stock | Description`\n\n"
-        "2) Delivery rasm biriktirish:\n"
-        "`/set_delivery ProductID | https://image-url | Caption`\n\n"
-        "3) Product disable:\n"
-        "`/disable_product ID`\n\n"
-        "4) Ro‘yxat:\n"
-        "`/list_products`\n\n"
-        "5) Pending orderlar:\n"
-        "`/pending`\n"
-    )
-
-
-@dp.message_handler(commands=["add_product"])
-async def addprod(m: types.Message):
-    if not is_admin(m.from_user.id):
-        return
-    try:
-        raw = m.get_args()
-        name, price, stock, desc = [x.strip() for x in raw.split("|", 3)]
-        add_product(name, desc, float(price), int(stock))
-        await m.answer("✅ Product qo‘shildi.")
-    except Exception:
-        await m.answer("❌ Format:\n`/add_product Name | 25 | 999 | Description`")
-
-
-@dp.message_handler(commands=["set_delivery"])
-async def setdel(m: types.Message):
-    if not is_admin(m.from_user.id):
-        return
-    try:
-        raw = m.get_args()
-        pid_s, url, caption = [x.strip() for x in raw.split("|", 2)]
-        pid = int(pid_s)
-        if not url.startswith("http"):
-            return await m.answer("❌ URL http/https bo‘lsin.")
-        set_delivery(pid, url, caption)
-        await m.answer("✅ Delivery rasm biriktirildi.")
-    except Exception:
-        await m.answer("❌ Format:\n`/set_delivery 2 | https://image-url | Caption`")
-
-
-@dp.message_handler(commands=["disable_product"])
-async def delprod(m: types.Message):
-    if not is_admin(m.from_user.id):
-        return
-    try:
-        pid = int(m.get_args().strip())
-        disable_product(pid)
-        await m.answer(f"✅ Product #{pid} disabled.")
-    except Exception:
-        await m.answer("❌ Misol: `/disable_product 12`")
-
-
-@dp.message_handler(commands=["list_products"])
-async def listprod(m: types.Message):
-    if not is_admin(m.from_user.id):
-        return
-    ps = list_products(active_only=False)
-    if not ps:
-        return await m.answer("Bo‘sh.")
-    lines = []
-    for p in ps[:50]:
-        lines.append(
-            f"#{p['id']} | {'ON' if int(p['is_active'])==1 else 'OFF'} | "
-            f"{p['name']} | ${float(p['price_usd']):.2f} | stock:{int(p['stock'])} | "
-            f"delivery:{'YES' if (p['delivery_photo_url'] or '') else 'NO'}"
+    await call.message.edit_text(
+        f"✅ To‘lov tasdiqlandi!\n\nBuyurtma: <code>{order_code}</code>\nTXID: <code>{txid}</code>",
+        reply_markup=InlineKeyboardMarkup().add(
+            InlineKeyboardButton("🏠 Asosiy menyu", callback_data="back_menu")
         )
-    await m.answer("\n".join(lines))
+    )
+    await call.answer("To‘landi ✅", show_alert=True)
 
-
-@dp.message_handler(commands=["pending"])
-async def pending(m: types.Message):
-    if not is_admin(m.from_user.id):
+# =========================
+# ADMIN PANEL
+# =========================
+@dp.message_handler(lambda m: m.text == "🛠 Admin panel")
+async def admin_panel(message: types.Message):
+    if not is_admin(message.from_user.id):
         return
-    os_ = pending_orders(30)
-    if not os_:
-        return await m.answer("Pending yo‘q.")
-    lines = []
-    for o in os_:
-        lines.append(f"#{o['id']} | user:{o['tg_id']} | pid:{o['product_id']} | {float(o['amount_ltc']):.8f} LTC | ${float(o['amount_usd']):.2f}")
-    await m.answer("\n".join(lines))
+    ikb = InlineKeyboardMarkup(row_width=1)
+    ikb.add(
+        InlineKeyboardButton("➕ Mahsulot qo‘shish", callback_data="adm:addp"),
+        InlineKeyboardButton("📦 Buyurtmalar (10)", callback_data="adm:orders"),
+        InlineKeyboardButton("🛒 Mahsulotlar", callback_data="adm:products"),
+    )
+    await message.answer("🛠 <b>Admin panel</b>", reply_markup=ikb)
 
+@dp.callback_query_handler(lambda c: c.data == "adm:addp")
+async def adm_addp(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Ruxsat yo'q", show_alert=True)
+        return
+    await call.message.edit_text("➕ Mahsulot nomini kiriting:")
+    await AddProduct.name.set()
+    await call.answer()
 
-@dp.message_handler(lambda m: m.text == "🛒 Shop")
-async def shop(m: types.Message):
-    ensure_user(m.from_user.id)
-    if not LTC_ADDRESS:
-        return await m.answer("❌ LTC_ADDRESS sozlanmagan (Railway Variables).")
-    items = list_products(True)
-    if not items:
-        return await m.answer("Hozircha tovar yo‘q.")
-    await m.answer("🛒 Vitrina:", reply_markup=products_kb())
+@dp.message_handler(state=AddProduct.name)
+async def adm_addp_name(message: types.Message, state: FSMContext):
+    await state.update_data(name=message.text.strip())
+    await message.answer("💵 Narx (USD) kiriting. Masalan: 25")
+    await AddProduct.price.set()
 
+@dp.message_handler(state=AddProduct.price)
+async def adm_addp_price(message: types.Message, state: FSMContext):
+    try:
+        price = float(message.text.strip().replace(",", "."))
+        if price <= 0:
+            raise ValueError()
+    except Exception:
+        await message.answer("❌ Narx noto'g'ri. Masalan: 25 yoki 45")
+        return
+    await state.update_data(price=price)
 
-@dp.message_handler(lambda m: m.text == "💰 Balance")
-async def bal(m: types.Message):
-    ensure_user(m.from_user.id)
-    await m.answer(f"💰 Balans: ${get_balance(m.from_user.id):.2f}")
+    ikb = ReplyKeyboardMarkup(resize_keyboard=True)
+    for c in CITIES:
+        ikb.add(KeyboardButton(c))
+    ikb.add(KeyboardButton("ALL"))
+    await message.answer("🏙 Qaysi shahar uchun? (yoki ALL)", reply_markup=ikb)
+    await AddProduct.city.set()
 
+@dp.message_handler(state=AddProduct.city)
+async def adm_addp_city(message: types.Message, state: FSMContext):
+    city = message.text.strip()
+    if city != "ALL" and city not in CITIES:
+        await message.answer("❌ Shahar noto'g'ri. Tugmadan tanlang.")
+        return
+    await state.update_data(city=city)
+    await message.answer("🖼 Photo URL kiriting (bo‘sh qoldirsang ham bo‘ladi). Agar bo‘sh bo‘lsa: '-' yubor.")
+    await AddProduct.photo.set()
 
-@dp.message_handler(lambda m: m.text == "📦 My Orders")
-async def my_orders(m: types.Message):
-    ensure_user(m.from_user.id)
-    rows = user_orders(m.from_user.id, 15)
+@dp.message_handler(state=AddProduct.photo)
+async def adm_addp_photo(message: types.Message, state: FSMContext):
+    photo = message.text.strip()
+    if photo == "-":
+        photo = ""
+    await state.update_data(photo=photo)
+    await message.answer("📝 Tavsif kiriting (1-2 qator):")
+    await AddProduct.desc.set()
+
+@dp.message_handler(state=AddProduct.desc)
+async def adm_addp_desc(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    name = data["name"]
+    price = data["price"]
+    city = data["city"]
+    photo = data["photo"]
+    desc = message.text.strip()
+
+    conn = db()
+    conn.execute(
+        "INSERT INTO products(name, price_usd, city, photo_url, description, is_active) VALUES(?,?,?,?,?,1)",
+        (name, price, city, photo, desc)
+    )
+    conn.commit()
+    conn.close()
+
+    await state.finish()
+    await message.answer("✅ Mahsulot qo‘shildi.", reply_markup=main_menu_kb(is_admin=True))
+
+@dp.callback_query_handler(lambda c: c.data == "adm:orders")
+async def adm_orders(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Ruxsat yo'q", show_alert=True)
+        return
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT o.order_code, o.status, o.amount_usd, o.ltc_amount, o.txid, o.created_at, p.name
+        FROM orders o
+        LEFT JOIN products p ON p.id=o.product_id
+        ORDER BY o.id DESC
+        LIMIT 10
+    """)
+    rows = cur.fetchall()
+    conn.close()
+
     if not rows:
-        return await m.answer("Orderlar yo‘q.")
-    lines = []
-    for o in rows:
+        await call.message.edit_text("📦 Buyurtmalar yo‘q.")
+        return
+
+    lines = ["📦 <b>So‘nggi 10 ta buyurtma</b>\n"]
+    for r in rows:
         lines.append(
-            f"#{o['id']} | {o['product_name']} | {o['status']} | "
-            f"{float(o['amount_ltc']):.8f} LTC | ${float(o['amount_usd']):.2f}"
+            f"• <b>{r['name'] or 'Mahsulot'}</b>\n"
+            f"  ID: <code>{r['order_code']}</code>\n"
+            f"  Status: <b>{r['status']}</b>\n"
+            f"  ${fmt_money(r['amount_usd'])} | {fmt_ltc(r['ltc_amount'])} LTC\n"
+            f"  TXID: <code>{r['txid'] or '-'}</code>\n"
         )
-    await m.answer("\n".join(lines))
 
+    ikb = InlineKeyboardMarkup().add(InlineKeyboardButton("⬅️ Orqaga", callback_data="adm:back"))
+    await call.message.edit_text("\n".join(lines), reply_markup=ikb)
+    await call.answer()
 
-@dp.message_handler(lambda m: m.text == "ℹ️ Info")
-async def info(m: types.Message):
-    await m.answer(
-        "ℹ️ *To‘lov:* Litecoin (LTC)\n"
-        "Bot order uchun aniq LTC miqdorini beradi.\n"
-        "To‘lov tasdiqlansa, bot sizga *delivery rasm* yuboradi."
-    )
+@dp.callback_query_handler(lambda c: c.data == "adm:products")
+async def adm_products(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Ruxsat yo'q", show_alert=True)
+        return
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM products ORDER BY id DESC LIMIT 20")
+    rows = cur.fetchall()
+    conn.close()
 
+    if not rows:
+        await call.message.edit_text("🛒 Mahsulot yo‘q.")
+        return
 
-@dp.callback_query_handler(lambda c: c.data == "shop:refresh")
-async def cb_refresh(c: types.CallbackQuery):
-    await c.message.edit_reply_markup(reply_markup=products_kb())
-    await c.answer("OK")
+    ikb = InlineKeyboardMarkup(row_width=1)
+    txt = ["🛒 <b>Mahsulotlar</b> (20)\n"]
+    for p in rows:
+        status = "✅" if p["is_active"] == 1 else "⛔️"
+        txt.append(f"{status} <b>{p['name']}</b> — ${fmt_money(p['price_usd'])} — {p['city']}")
+        ikb.add(InlineKeyboardButton(f"{status} Toggle: {p['name']}", callback_data=f"adm:toggle:{p['id']}"))
+    ikb.add(InlineKeyboardButton("⬅️ Orqaga", callback_data="adm:back"))
+    await call.message.edit_text("\n".join(txt), reply_markup=ikb)
+    await call.answer()
 
+@dp.callback_query_handler(lambda c: c.data.startswith("adm:toggle:"))
+async def adm_toggle(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Ruxsat yo'q", show_alert=True)
+        return
+    pid = int(call.data.split(":")[2])
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT is_active FROM products WHERE id=?", (pid,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        await call.answer("Topilmadi", show_alert=True)
+        return
+    new_val = 0 if row["is_active"] == 1 else 1
+    cur.execute("UPDATE products SET is_active=? WHERE id=?", (new_val, pid))
+    conn.commit()
+    conn.close()
+    await call.answer("O'zgardi ✅")
+    # refresh list
+    await adm_products(call)
 
-@dp.callback_query_handler(lambda c: c.data == "shop:back")
-async def cb_back(c: types.CallbackQuery):
-    await c.message.edit_text("🛒 Vitrina:", reply_markup=products_kb())
-    await c.answer()
-
-
-@dp.callback_query_handler(lambda c: c.data.startswith("p:"))
-async def cb_product(c: types.CallbackQuery):
-    pid = int(c.data.split(":")[1])
-    p = get_product(pid)
-    if not p or int(p["is_active"]) != 1:
-        return await c.answer("Topilmadi", show_alert=True)
-
-    txt = (
-        f"🧾 *{p['name']}*\n"
-        f"💵 ${float(p['price_usd']):.2f}\n"
-        f"📦 Stock: {int(p['stock'])}\n\n"
-        f"{p['description']}"
-    )
-    await c.message.edit_text(txt, reply_markup=product_kb(pid))
-    await c.answer()
-
-
-@dp.callback_query_handler(lambda c: c.data.startswith("buy:"))
-async def cb_buy(c: types.CallbackQuery):
-    ensure_user(c.from_user.id)
-
-    _, pid_s, qty_s = c.data.split(":")
-    pid = int(pid_s)
-    qty = int(qty_s)
-
-    p = get_product(pid)
-    if not p or int(p["is_active"]) != 1:
-        return await c.answer("Topilmadi", show_alert=True)
-    if int(p["stock"]) < qty:
-        return await c.answer("Stock yetarli emas", show_alert=True)
-
-    amount_usd = float(p["price_usd"]) * qty
-    rate = await usd_per_ltc()
-    base_ltc = amount_usd / rate
-    amount_ltc = make_unique_amount(base_ltc)
-
-    order_id = create_order(c.from_user.id, pid, qty, amount_usd, rate, amount_ltc)
-
-    msg = (
-        f"🧾 *Order #{order_id}*\n"
-        f"📦 {p['name']} x{qty}\n"
-        f"💵 ${amount_usd:.2f}\n\n"
-        f"➡️ Address: `{LTC_ADDRESS}`\n"
-        f"➡️ Amount: *{amount_ltc:.8f} LTC*\n\n"
-        f"⚠️ Aynan shu miqdorni yuboring.\n"
-        f"Confirmations: {MIN_CONFIRMATIONS}+ bo‘lsa auto tasdiq."
-    )
-    await c.message.edit_text(msg, reply_markup=order_kb(order_id))
-    await c.answer()
-
-
-@dp.callback_query_handler(lambda c: c.data.startswith("order:check:"))
-async def cb_check(c: types.CallbackQuery):
-    order_id = int(c.data.split(":")[2])
-    o = get_order(order_id)
-    if not o or int(o["tg_id"]) != c.from_user.id:
-        return await c.answer("Order topilmadi", show_alert=True)
-    if o["status"] != "pending":
-        return await c.answer(f"Status: {o['status']}", show_alert=True)
-
-    ok, txid, conf = await try_match_order(o)
-    if ok and txid:
-        mark_tx_seen(txid)
-        mark_order_paid(order_id, txid)
-        add_balance(c.from_user.id, float(o["amount_usd"]))
-
-        # send delivery
-        await send_delivery(c.from_user.id, order_id)
-
-        await c.answer("Paid ✅", show_alert=True)
-    else:
-        await c.answer("Hali to‘lov topilmadi", show_alert=True)
-
+@dp.callback_query_handler(lambda c: c.data == "adm:back")
+async def adm_back(call: types.CallbackQuery):
+    await call.message.delete()
+    await bot.send_message(call.from_user.id, "🛠 Admin panel", reply_markup=main_menu_kb(is_admin=True))
 
 # =========================
-# STARTUP
+# FALLBACK
 # =========================
-async def on_startup(_):
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN missing")
-    init_db()
+@dp.message_handler()
+async def fallback(message: types.Message):
+    # keep it simple: send menu hint
+    kb = main_menu_kb(is_admin=is_admin(message.from_user.id))
+    await message.answer("Menyudan tanlang 👇", reply_markup=kb)
 
-    # seed 2 products if empty (optional)
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) c FROM products")
-        if int(cur.fetchone()["c"]) == 0:
-            add_product("Product 1", "Description 1", 25.0, 999)
-            add_product("Product 2", "Description 2", 45.0, 999)
-
-    asyncio.create_task(payment_watcher())
-
-
+# =========================
+# RUN
+# =========================
 if __name__ == "__main__":
-    executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
+    init_db()
+    executor.start_polling(dp, skip_updates=True)
