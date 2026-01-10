@@ -3,6 +3,7 @@ import time
 import sqlite3
 import logging
 import hashlib
+import asyncio
 from datetime import datetime, timezone
 from typing import Optional, List, Tuple
 
@@ -103,7 +104,6 @@ def normalize_extpub(key: str) -> str:
         data = _b58check_decode(k)
         xpub_ver = bytes.fromhex("0488b21e")
         return _b58check_encode(xpub_ver + data[4:])
-    # Accept also Zpub/Ypub
     if k[:4] in ("Zpub", "Ypub", "Xpub"):
         data = _b58check_decode(k)
         xpub_ver = bytes.fromhex("0488b21e")
@@ -187,7 +187,6 @@ def init_db():
         """)
         conn.commit()
 
-        # seed products if empty
         cur.execute("SELECT COUNT(*) c FROM products")
         if int(cur.fetchone()["c"]) == 0:
             cur.executemany("""
@@ -208,23 +207,23 @@ def is_admin(uid: int) -> bool:
     return ADMIN_ID > 0 and uid == ADMIN_ID
 
 def ensure_user(uid: int):
+    """
+    Guarantees:
+    - each TG user gets a stable unique addr_index
+    - address is derived once and stored
+    """
     now = int(time.time())
     with db() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT tg_id FROM users WHERE tg_id=?", (uid,))
-        if cur.fetchone() is not None:
+
+        row = cur.execute("SELECT tg_id FROM users WHERE tg_id=?", (uid,)).fetchone()
+        if row:
             return
 
-        cur.execute("SELECT MAX(addr_index) mx FROM users")
-        mx = cur.fetchone()["mx"]
+        mx = cur.execute("SELECT MAX(addr_index) mx FROM users").fetchone()["mx"]
         idx = int(mx) + 1 if mx is not None else 0
 
-        try:
-            addr = derive_ltc_address(idx)
-        except Exception as e:
-            # Keep bot alive even if derivation fails; admin can fix xpub later.
-            log.exception("Address derivation failed: %s", e)
-            addr = "DERIVE_ERROR"
+        addr = derive_ltc_address(idx)
 
         cur.execute("""
             INSERT INTO users(tg_id, city, addr_index, ltc_address, created_at)
@@ -259,12 +258,6 @@ def add_balance(uid: int, amt: float):
         conn.execute("UPDATE balances SET ltc=ltc+?, updated_at=? WHERE tg_id=?", (amt, now, uid))
         conn.commit()
 
-def sub_balance(uid: int, amt: float):
-    now = int(time.time())
-    with db() as conn:
-        conn.execute("UPDATE balances SET ltc=ltc-?, updated_at=? WHERE tg_id=?", (amt, now, uid))
-        conn.commit()
-
 def list_products(active_only: bool = True) -> List[sqlite3.Row]:
     with db() as conn:
         if active_only:
@@ -274,17 +267,6 @@ def list_products(active_only: bool = True) -> List[sqlite3.Row]:
 def get_product(pid: int) -> Optional[sqlite3.Row]:
     with db() as conn:
         return conn.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
-
-def create_order(uid: int, pid: int, amt: float) -> int:
-    now = int(time.time())
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO orders(tg_id, product_id, amount_ltc, status, created_at)
-            VALUES(?,?,?,'PAID',?)
-        """, (uid, pid, amt, now))
-        conn.commit()
-        return int(cur.lastrowid)
 
 def user_orders(uid: int, limit: int = 15) -> List[sqlite3.Row]:
     with db() as conn:
@@ -311,7 +293,6 @@ def fetch_incoming(address: str) -> List[Tuple[str, int]]:
     txrefs = r.get("txrefs", []) or []
     outs = []
     for t in txrefs:
-        # incoming outputs: tx_input_n == -1
         if int(t.get("tx_input_n", 0)) != -1:
             continue
         if int(t.get("confirmations", 0)) < MIN_CONFIRMATIONS:
@@ -322,7 +303,7 @@ def fetch_incoming(address: str) -> List[Tuple[str, int]]:
 def credit_new(uid: int) -> int:
     u = get_user(uid)
     addr = (u["ltc_address"] or "").strip()
-    if not addr or addr == "DERIVE_ERROR":
+    if not addr:
         return 0
 
     try:
@@ -403,6 +384,7 @@ def main_menu_kb(admin: bool = False) -> types.ReplyKeyboardMarkup:
 def profile_kb() -> types.InlineKeyboardMarkup:
     ikb = types.InlineKeyboardMarkup(row_width=1)
     ikb.add(
+        types.InlineKeyboardButton("➕ Пополнить баланс", callback_data="profile:topup"),
         types.InlineKeyboardButton("🛍 История покупок", callback_data="profile:orders"),
         types.InlineKeyboardButton("🔄 Изменить город", callback_data="city:change"),
         types.InlineKeyboardButton("🏠 Главное меню", callback_data="go:menu"),
@@ -543,6 +525,19 @@ async def profile(m: types.Message):
         reply_markup=profile_kb()
     )
 
+@dp.callback_query_handler(lambda c: c.data == "profile:topup")
+async def profile_topup(c: types.CallbackQuery):
+    u = get_user(c.from_user.id)
+    bal = get_balance(c.from_user.id)
+    await c.message.edit_text(
+        f"💰 <b>Баланс</b>\n\n"
+        f"Текущий: <b>{bal:.8f} LTC</b>\n\n"
+        f"➕ Отправьте LTC на ваш адрес:\n<code>{u['ltc_address']}</code>\n\n"
+        f"После оплаты нажмите «Проверить пополнение».",
+        reply_markup=balance_kb()
+    )
+    await c.answer()
+
 @dp.callback_query_handler(lambda c: c.data == "profile:orders")
 async def profile_orders(c: types.CallbackQuery):
     rows = user_orders(c.from_user.id, 15)
@@ -560,7 +555,6 @@ async def profile_orders(c: types.CallbackQuery):
 @dp.callback_query_handler(lambda c: c.data == "profile:back")
 async def profile_back(c: types.CallbackQuery):
     await c.message.delete()
-    # resend profile
     u = get_user(c.from_user.id)
     bal = get_balance(c.from_user.id)
     await bot.send_message(
@@ -654,24 +648,41 @@ async def buy(c: types.CallbackQuery):
         return
 
     price = float(p["price_ltc"])
-    bal = get_balance(c.from_user.id)
-    if bal + 1e-12 < price:
-        await c.answer("Недостаточно средств", show_alert=True)
-        u = get_user(c.from_user.id)
-        await c.message.edit_text(
-            f"❌ <b>Недостаточно средств</b>\n\n"
-            f"Цена: <b>{price:.8f} LTC</b>\n"
-            f"Баланс: <b>{bal:.8f} LTC</b>\n\n"
-            f"Пополните на адрес:\n<code>{u['ltc_address']}</code>\n"
-            f"Затем нажмите «Проверить пополнение» в разделе Баланс.",
-            reply_markup=types.InlineKeyboardMarkup(row_width=1).add(
-                types.InlineKeyboardButton("💰 Баланс", callback_data="go:menu")
-            )
-        )
-        return
+    now = int(time.time())
 
-    sub_balance(c.from_user.id, price)
-    order_id = create_order(c.from_user.id, pid, price)
+    # ATOMIC: check + deduct + order in one transaction
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT ltc FROM balances WHERE tg_id=?", (c.from_user.id,))
+        row = cur.fetchone()
+        bal = float(row["ltc"]) if row else 0.0
+
+        if bal + 1e-12 < price:
+            await c.answer("Недостаточно средств", show_alert=True)
+            u = get_user(c.from_user.id)
+            await c.message.edit_text(
+                f"❌ <b>Недостаточно средств</b>\n\n"
+                f"Цена: <b>{price:.8f} LTC</b>\n"
+                f"Баланс: <b>{bal:.8f} LTC</b>\n\n"
+                f"Пополните на адрес:\n<code>{u['ltc_address']}</code>\n"
+                f"Затем нажмите «Проверить пополнение» в разделе Баланс.",
+                reply_markup=types.InlineKeyboardMarkup(row_width=1).add(
+                    types.InlineKeyboardButton("💰 Открыть Баланс", callback_data="profile:topup"),
+                    types.InlineKeyboardButton("🏠 Главное меню", callback_data="go:menu"),
+                )
+            )
+            return
+
+        cur.execute(
+            "UPDATE balances SET ltc=ltc-?, updated_at=? WHERE tg_id=?",
+            (price, now, c.from_user.id)
+        )
+        cur.execute("""
+            INSERT INTO orders(tg_id, product_id, amount_ltc, status, created_at)
+            VALUES(?,?,?,'PAID',?)
+        """, (c.from_user.id, pid, price, now))
+        order_id = int(cur.lastrowid)
+        conn.commit()
 
     delivery_text = (p["delivery_text"] or "").strip() or "Инструкция будет добавлена админом."
     caption = (
@@ -685,7 +696,6 @@ async def buy(c: types.CallbackQuery):
 
     try:
         if photo:
-            # photo can be URL or Telegram file_id
             await bot.send_photo(c.from_user.id, photo=photo, caption=caption)
         else:
             await bot.send_message(c.from_user.id, caption)
